@@ -13,19 +13,9 @@ if str(ORIGINAL_CODE_DIR) not in sys.path:
 
 # Reuse the original DEKP model code directly so bench runs preserve the
 # original graph-encoder behavior instead of a bench-specific reimplementation.
-from pretrain import (  # noqa: E402
-    CNN,
-    Context,
-    EdgeMLP,
-    FeedForward,
-    GATLayer,
-    GraphEncoder,
-    HighwayMLP,
-    MLP,
-    MetaDecoder,
-    ResidualMLP,
-    SeqEncoder,
-)
+from pretrain import MetaDecoder  # noqa: E402
+
+__all__ = ["MetaDecoder", "graph_collate_fn"]
 
 
 def graph_collate_fn(batch: Sequence[Tuple]):

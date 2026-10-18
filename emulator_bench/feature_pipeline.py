@@ -1,14 +1,12 @@
 import math
-import os
 import pickle
+import re
 import sys
-from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from rdkit import Chem
 from rdkit import RDLogger
 from torch import nn
@@ -21,12 +19,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from emulator_bench.common import normalize_sequence
-
 
 RDLogger.DisableLog("rdApp.warning")
 
 DEFAULT_TRFM_WEIGHTS = REPO_ROOT / "emulator_bench" / "trfm_12_23000.pkl"
+GRAPH_RADIUS = 10
+GRAPH_NEIGHBORS = 20
 DEFAULT_TRFM_VOCAB = REPO_ROOT / "DEKP" / "vocab.pkl"
 
 
@@ -107,9 +105,9 @@ class TrfmSeq2seq(nn.Module):
         )
         self.out = nn.Linear(hidden_size, out_size)
 
-    def _encode(self, src):
-        embedded = self.embed(src)
-        embedded = self.pe(embedded)
+    def encode(self, src, columns):
+        """Encode src (T, B). Column b gets pe[b], as the original batched call does (its pe slice runs over the batch axis)."""
+        embedded = self.embed(src) + self.pe.pe[0, columns]
         output = embedded
         for idx in range(self.trfm.encoder.num_layers - 1):
             output = self.trfm.encoder.layers[idx](output, None)
@@ -120,26 +118,23 @@ class TrfmSeq2seq(nn.Module):
         output = output.detach().cpu().numpy()
         return np.hstack([np.mean(output, axis=0), np.max(output, axis=0), output[0, :, :], penultimate[0, :, :]])
 
-    def encode(self, src):
-        batch_size = src.shape[1]
-        if batch_size <= 100:
-            return self._encode(src)
-        outputs = [self._encode(src[:, :100])]
-        for start in range(100, batch_size, 100):
-            outputs.append(self._encode(src[:, start : start + 100]))
-        return np.concatenate(outputs, axis=0)
+
+_TRFM_PAIRS = set(
+    "Cl Ca Cu Br Be Ba Bi Si Se Sr Na Ni Rb Ra Xe Li Al As Ag Au Mg Mn Te Zn si se te He +2 +3 +4 -2 -3 -4 Kr Fe".split()
+)
 
 
 def split_smiles_for_trfm(smiles: str) -> str:
-    pattern = r"(\[[^\]]+]|Br?|Cl?|Si|Se|Na|Li|Mg|Ca|Zn|Fe|Cu|Mn|Al|As|Ag|Au|Ni|Rb|Ra|Xe|Sr|Ba|Bi|Be|Te|He|\%\d{2}|.)"
-    tokens = [token for token in re_findall(pattern, str(smiles).strip()) if token]
+    """Same split as `split` in the original utils.py (used by extract_smiles_trfm_features.py)."""
+    smiles = str(smiles)
+    tokens, i = [], 0
+    while i < len(smiles) - 1:
+        width = 3 if smiles[i] == "%" else 2 if smiles[i : i + 2] in _TRFM_PAIRS else 1
+        tokens.append(smiles[i : i + width])
+        i += width
+    if i == len(smiles) - 1:
+        tokens.append(smiles[i])
     return " ".join(tokens)
-
-
-def re_findall(pattern: str, text: str) -> List[str]:
-    import regex as re
-
-    return re.findall(pattern, text)
 
 
 def get_trfm_inputs(smiles_values: Sequence[str], vocab: WordVocab, seq_len: int = 220) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -177,11 +172,11 @@ def load_smiles_transformer(weights_path: str | Path | None = None, vocab_path: 
     return model, vocab
 
 
-def embed_smiles_trfm_batch(smiles_values: Sequence[str], model: TrfmSeq2seq, vocab: WordVocab, device: torch.device) -> Dict[str, np.ndarray]:
+def embed_smiles_trfm_batch(smiles_values: Sequence[str], columns: Sequence[int], model: TrfmSeq2seq, vocab: WordVocab, device: torch.device) -> Dict[str, np.ndarray]:
     xid, _ = get_trfm_inputs(smiles_values, vocab=vocab)
     xid = torch.t(xid).to(device)
     with torch.no_grad():
-        embeddings = model.encode(xid)
+        embeddings = model.encode(xid, torch.as_tensor(list(columns), device=device))
     return {
         smiles: np.asarray(embeddings[idx], dtype=np.float32)
         for idx, smiles in enumerate(smiles_values)
@@ -196,44 +191,21 @@ def load_prot_t5(model_name_or_path: str, device: torch.device):
     return model, tokenizer
 
 
-def build_prot_t5_batches(sequences: Sequence[str], max_residues: int = 4000, max_seq_len: int = 2500, max_batch: int = 16) -> List[List[str]]:
-    ordered = sorted(sequences, key=len, reverse=True)
-    batches: List[List[str]] = []
-    batch: List[str] = []
-    batch_residues = 0
-    for sequence in ordered:
-        sequence = normalize_sequence(sequence, max_len=max_seq_len)
-        seq_len = len(sequence)
-        if batch and (len(batch) >= max_batch or batch_residues + seq_len > max_residues):
-            batches.append(batch)
-            batch = []
-            batch_residues = 0
-        batch.append(sequence)
-        batch_residues += seq_len
-    if batch:
-        batches.append(batch)
-    return batches
+def embed_prot_t5(model, tokenizer, sequence: str, device: torch.device) -> np.ndarray:
+    """Mean ProtT5 residue vector as in `Seq_to_vec` of extract_prott5_feature.py.
 
-
-def embed_prot_t5_batch(model, tokenizer, sequences: Sequence[str], device: torch.device) -> Dict[str, np.ndarray]:
-    normalized_sequences = [normalize_sequence(seq) for seq in sequences]
-    tokenized = [" ".join(list(sequence)) for sequence in normalized_sequences]
-    encoding = tokenizer(
-        tokenized,
-        add_special_tokens=True,
-        padding="longest",
-        return_tensors="pt",
-    )
-    input_ids = encoding["input_ids"].to(device)
+    Sequences over 1000 residues keep the first and last 500. One sequence per forward pass, fp32.
+    The </s> position is dropped. The mean is summed in float64, residue by residue.
+    """
+    sequence = str(sequence)
+    if len(sequence) > 1000:
+        sequence = sequence[:500] + sequence[-500:]
+    encoding = tokenizer([re.sub(r"[UZOB]", "X", " ".join(sequence))], add_special_tokens=True, padding=True, return_tensors="pt")
     attention_mask = encoding["attention_mask"].to(device)
     with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-    embedded = {}
-    for idx, sequence in enumerate(normalized_sequences):
-        seq_len = len(sequence)
-        pooled = outputs[idx, :seq_len].mean(dim=0)
-        embedded[sequence] = pooled.detach().to(dtype=torch.float32).cpu().numpy()
-    return embedded
+        hidden = model(input_ids=encoding["input_ids"].to(device), attention_mask=attention_mask).last_hidden_state
+    residues = hidden[0, : int(attention_mask.sum()) - 1].cpu().numpy().astype(np.float64)
+    return residues.cumsum(axis=0)[-1] / len(residues)
 
 
 def load_pickle(path: Path) -> Dict:
@@ -298,21 +270,21 @@ def load_structure_graph_builder():
     return parse_pdb, get_geo_feat
 
 
-def parse_pdb_to_array(pdb_path: Path, nneighbor: int = 32, atom_type: str = "CA") -> np.ndarray:
+def parse_pdb_to_array(pdb_path: Path, atom_type: str = "CA") -> np.ndarray:
     parse_pdb, get_geo_feat = load_structure_graph_builder()
     try:
-        pdb_array = parse_pdb(str(pdb_path), atom_type=atom_type, nneighbor=nneighbor, cal_cb=True)
+        pdb_array = parse_pdb(str(pdb_path), atom_type=atom_type, nneighbor=GRAPH_NEIGHBORS, cal_cb=True)
     except Exception as exc:
         raise RuntimeError(f"Failed to build graph from PDB `{pdb_path}`") from exc
     return pdb_array
 
 
-def build_graph_from_array(pdb_array: np.ndarray, nneighbor: int = 32, device: str | torch.device = "cpu") -> Data:
+def build_graph_from_array(pdb_array: np.ndarray, device: str | torch.device = "cpu") -> Data:
+    """Same graph as DEKP get_graph_fea defaults: C-alpha radius graph, radius 10, at most 20 neighbours."""
     _, get_geo_feat = load_structure_graph_builder()
-    graph_device = torch.device(device)
-    x = torch.tensor(pdb_array, dtype=torch.float32, device=graph_device)
-    ca_pos = x[:, 1]
-    edge_index = radius_graph(ca_pos, r=15.0, loop=False, max_num_neighbors=nneighbor)
+    x = torch.tensor(pdb_array, dtype=torch.float32, device=torch.device(device))
+    ca_pos = x[:, 1].contiguous()
+    edge_index = radius_graph(ca_pos, r=GRAPH_RADIUS, loop=False, max_num_neighbors=GRAPH_NEIGHBORS)
     node_feature, edge_feature = get_geo_feat(x, edge_index)
     return Data(
         x=node_feature.float().cpu(),
@@ -321,9 +293,8 @@ def build_graph_from_array(pdb_array: np.ndarray, nneighbor: int = 32, device: s
     )
 
 
-def build_graph_from_pdb(pdb_path: Path, nneighbor: int = 32, atom_type: str = "CA", device: str | torch.device = "cpu") -> Data:
-    pdb_array = parse_pdb_to_array(pdb_path, nneighbor=nneighbor, atom_type=atom_type)
-    return build_graph_from_array(pdb_array, nneighbor=nneighbor, device=device)
+def build_graph_from_pdb(pdb_path: Path, atom_type: str = "CA", device: str | torch.device = "cpu") -> Data:
+    return build_graph_from_array(parse_pdb_to_array(pdb_path, atom_type=atom_type), device=device)
 
 
 def compute_dssp_feature(pdb_path: Path, dssp_executable: str | None = None) -> np.ndarray:

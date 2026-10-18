@@ -11,22 +11,22 @@ from Bio.Align import PairwiseAligner
 from Bio.PDB import PDBParser, is_aa
 from Bio.SeqUtils import seq1
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import (
-    DEFAULT_BASE_DIR,
-    DEFAULT_MANIFESTS_DIR,
     DEFAULT_SPLIT_GROUPS,
+    INTERMEDIATE_DIR,
     KEY_COLUMNS,
+    TASKS,
     atomic_json,
     discover_split_jobs,
     load_json,
@@ -36,13 +36,15 @@ from emulator_bench.common import (
     read_table,
     require_columns,
     stable_hash,
+    task_paths,
     write_table,
 )
 
 
-DEFAULT_EXPERIMENTAL_PDB_DIR = Path("/home/da24s023/github/EMULaToR/data/intermediate/processed_exp_pdb")
-DEFAULT_ALPHAFOLD_PDB_DIR = Path("/home/da24s023/github/EMULaToR/data/intermediate/alphafold")
-DEFAULT_ESM_PDB_DIR = Path("/home/da24s023/github/EMULaToR/data/intermediate/esm")
+DEFAULT_EXPERIMENTAL_PDB_DIR = INTERMEDIATE_DIR / "processed_exp_pdb"
+DEFAULT_ALPHAFOLD_PDB_DIR = INTERMEDIATE_DIR / "alphafold"
+DEFAULT_ESM_PDB_DIR = INTERMEDIATE_DIR / "esmfold2_pdb"
+ESM_PDB_PREFIX = "ESMFold2-"
 PDB_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])([0-9][A-Za-z0-9]{3})(?![A-Za-z0-9])")
 STRUCTURE_MATCH_COLUMNS = ["smiles", "sequence", "value", "smiles_hash", "log10_value"]
 
@@ -123,9 +125,8 @@ def _build_esm_index(directory: Path) -> Dict[str, str]:
     if not directory.exists():
         return {}
     index = {}
-    prefix = "ESM3-open-small-"
-    for path in directory.glob(f"{prefix}*.pdb"):
-        key = path.name[len(prefix) : -len(".pdb")]
+    for path in directory.glob(f"{ESM_PDB_PREFIX}*.pdb"):
+        key = path.name[len(ESM_PDB_PREFIX) : -len(".pdb")]
         index[key] = str(path)
         index[key.upper()] = str(path)
     return index
@@ -167,29 +168,8 @@ def _row_key(row: dict) -> str:
     return stable_hash(json.dumps(payload, sort_keys=True))
 
 
-def _candidate_dataset_path(base_dir: Path, explicit: Path | None = None) -> Path:
-    if explicit is not None:
-        path = Path(explicit).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"Missing candidate parquet: {path}")
-        return path
-
-    preferred = [
-        base_dir / "kcat_kinetic_params_3d_aligned.parquet",
-        base_dir / "kcat_kinetic_params_3d.parquet",
-    ]
-    for path in preferred:
-        if path.exists():
-            return path
-
-    candidates = sorted(base_dir.glob("*_3d_aligned.parquet")) + sorted(base_dir.glob("*_3d.parquet"))
-    if candidates:
-        return candidates[0]
-    raise FileNotFoundError(f"No 3D candidate parquet found in {base_dir}")
-
-
-def _candidate_lookup(base_dir: Path, candidate_df_path: Path | None = None) -> Dict[str, List[dict]]:
-    path = _candidate_dataset_path(base_dir, candidate_df_path)
+def _candidate_lookup(candidate_df_path: Path) -> Dict[str, List[dict]]:
+    path = Path(candidate_df_path).expanduser()
     frame = read_table(path)
     require_columns(frame, KEY_COLUMNS + ["pdbs", "pdb_source", "pdb_type"], path)
     lookup: Dict[str, List[dict]] = {}
@@ -208,7 +188,7 @@ class StructureResolver:
         self.esm_index = _build_esm_index(args.esm_pdb_dir)
         self.identity_threshold = float(args.identity_threshold)
         self.aligner = _make_aligner()
-        cache_dir = Path(args.base_dir) / "_structure_alignment_cache"
+        cache_dir = Path(args.manifests_dir) / "_structure_alignment_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.sequence_cache_path = cache_dir / "pdb_sequence_cache.json"
         self.selection_cache_path = cache_dir / "selection_cache.json"
@@ -376,8 +356,9 @@ def prepared_manifest_is_valid(path: Path) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare DEKP EMULaToR split manifests with one resolved structure per row.")
-    parser.add_argument("--base_dir", type=Path, default=DEFAULT_BASE_DIR)
-    parser.add_argument("--manifests_dir", type=Path, default=DEFAULT_MANIFESTS_DIR)
+    parser.add_argument("--task", choices=TASKS, default="km")
+    parser.add_argument("--base_dir", type=Path, default=None)
+    parser.add_argument("--manifests_dir", type=Path, default=None)
     parser.add_argument("--candidate_df_path", type=Path, default=None)
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
     parser.add_argument("--threshold", type=str, default=None)
@@ -392,8 +373,10 @@ def main():
     parser.add_argument("--fail_on_unresolved", action="store_true")
     args = parser.parse_args()
 
-    args.base_dir = Path(args.base_dir).expanduser()
-    args.manifests_dir = Path(args.manifests_dir).expanduser()
+    paths = task_paths(args.task)
+    args.base_dir = Path(args.base_dir or paths["base_dir"]).expanduser()
+    args.manifests_dir = Path(args.manifests_dir or paths["manifests_dir"]).expanduser()
+    args.candidate_df_path = args.candidate_df_path or args.base_dir / f"{args.task}_kinetic_params_3d.parquet"
     args.experimental_pdb_dir = Path(args.experimental_pdb_dir).expanduser()
     args.alphafold_pdb_dir = Path(args.alphafold_pdb_dir).expanduser()
     args.esm_pdb_dir = Path(args.esm_pdb_dir).expanduser()
@@ -402,7 +385,7 @@ def main():
     jobs = discover_split_jobs(args.base_dir, args.split_groups, args.thresholds)
     if not jobs:
         raise FileNotFoundError(f"No split jobs found in {args.base_dir}")
-    candidates = _candidate_lookup(args.base_dir, args.candidate_df_path)
+    candidates = _candidate_lookup(args.candidate_df_path)
     resolver = StructureResolver(args)
 
     summaries = []

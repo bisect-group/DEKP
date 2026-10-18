@@ -5,7 +5,6 @@ import math
 import os
 import random
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -19,20 +18,22 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-DEFAULT_BASE_DIR = Path("~/github/EMULaToR/data/processed/baselines/DEKP").expanduser()
-DEFAULT_CACHE_DIR = DEFAULT_BASE_DIR / "embeddings"
-DEFAULT_MANIFESTS_DIR = DEFAULT_BASE_DIR / "dekp_manifests"
+EMULATOR_ROOT = REPO_ROOT.parents[1]
+DATA_ROOT = EMULATOR_ROOT / "data" / "processed" / "datasets" / "kinetic_dataset"
+INTERMEDIATE_DIR = EMULATOR_ROOT / "data" / "intermediate"
+OUT_ROOT = EMULATOR_ROOT / "outputs" / "baselines" / "DEKP"
+TASKS = ["km", "kcat"]
 DEFAULT_SPLIT_GROUPS = [
     "random_splits_grouped_sequence",
     "random_splits_grouped_smiles",
-    "enzyme_sequence_splits",
-    "enzyme_structure_splits",
-    "substrate_splits",
-    "conformer_cosine_splits",
     "uniprot_time_splits",
-    "group_shuffle_splits",
+    "enzyme_sequence_splits",
+    "substrate_splits",
 ]
+SEEDS = [666, 777, 888]
 DEFAULT_FEATURES = ["trfm", "t5"]
+# Part of the cache folder names. Raise it when token, vector or graph definitions change.
+CACHE_VERSION = 4
 KEY_COLUMNS = ["smiles", "sequence", "value", "smiles_hash", "uniprot_date", "log10_value"]
 
 COMMON_SEQUENCE_COLS = ["sequence", "Sequence"]
@@ -41,6 +42,15 @@ COMMON_TARGET_COLS = ["log10_value", "Label", "value"]
 COMMON_PROTEIN_ID_COLS = ["uniprot_id", "UniprotID", "Protein", "protein_id"]
 COMMON_STRUCTURE_ID_COLS = ["structure_id", "pdb_id", "uniprot_id", "UniprotID"]
 COMMON_CID_COLS = ["CID", "cid"]
+
+
+def task_paths(task: str, out_root: Path = OUT_ROOT) -> Dict[str, Path]:
+    return {
+        "base_dir": DATA_ROOT / task,
+        "cache_dir": Path(out_root) / task / "embeddings",
+        "manifests_dir": Path(out_root) / task / "manifests",
+        "out_dir": Path(out_root) / task / "runs",
+    }
 
 
 def _stable_hash(text: str) -> str:
@@ -64,21 +74,17 @@ def canonical_pdb_identity(pdb_type, pdb_source, pdb_record, structure_id, prote
 
 
 
-def normalize_sequence(sequence: str, max_len: int = 2500) -> str:
-    seq = str(sequence).strip().upper()[:max_len]
+def normalize_sequence(sequence: str) -> str:
+    seq = str(sequence).strip().upper()
     return seq.replace("U", "X").replace("Z", "X").replace("O", "X").replace("B", "X").replace("*", "")
-
-
-def protein_sequence_cache_max_len(token_max_len: int, special_tokens: int = 2) -> int:
-    return max(1, int(token_max_len) - int(special_tokens))
 
 
 def normalize_smiles(smiles: str) -> str:
     return str(smiles).strip()
 
 
-def protein_cache_key(sequence: str, max_len: int = 2500) -> str:
-    return _stable_hash(normalize_sequence(sequence, max_len=max_len))
+def protein_cache_key(sequence: str) -> str:
+    return _stable_hash(normalize_sequence(sequence))
 
 
 def ligand_cache_key(smiles: str) -> str:
@@ -92,31 +98,35 @@ def structure_cache_key(structure_id: str, fallback_sequence: str) -> str:
     return protein_cache_key(fallback_sequence)
 
 
-def protein_cache_path(cache_dir: Path, sequence: str, max_len: int = 2500) -> Path:
-    key = protein_cache_key(sequence, max_len=max_len)
-    return Path(cache_dir) / "proteins" / key[:2] / f"{key}.pt"
+def protein_cache_path(cache_dir: Path, sequence: str) -> Path:
+    key = protein_cache_key(sequence)
+    return Path(cache_dir) / f"proteins_v{CACHE_VERSION}" / key[:2] / f"{key}.pt"
 
 
-def ligand_cache_path(cache_dir: Path, smiles: str) -> Path:
+def trfm_column_map(table_path: Path) -> Dict[str, int]:
+    """Column of each SMILES in the original chunks of 100: (index of its last row in the full task table) % 100."""
+    smiles = pd.read_parquet(table_path, columns=["smiles"])["smiles"].astype(str).str.strip()
+    last_row = pd.Series(np.arange(len(smiles)), index=smiles.values)
+    return (last_row[~last_row.index.duplicated(keep="last")] % 100).to_dict()
+
+
+def trfm_fingerprint(columns: Dict[str, int]) -> str:
+    return _stable_hash(json.dumps(sorted(columns.items())))[:12]
+
+
+def ligand_cache_path(cache_dir: Path, smiles: str, fingerprint: str) -> Path:
+    """The folder name holds the column-map fingerprint, so a changed table rebuilds the ligand cache."""
     key = ligand_cache_key(smiles)
-    return Path(cache_dir) / "ligands" / key[:2] / f"{key}.pt"
+    return Path(cache_dir) / f"ligands_v{CACHE_VERSION}_{fingerprint}" / key[:2] / f"{key}.pt"
+
+
+def structures_cache_dir(cache_dir: Path) -> Path:
+    return Path(cache_dir) / f"structures_v{CACHE_VERSION}"
 
 
 def structure_cache_path(cache_dir: Path, structure_id: str, fallback_sequence: str) -> Path:
     key = structure_cache_key(structure_id, fallback_sequence)
-    return Path(cache_dir) / "structures" / key[:2] / f"{key}.pt"
-
-
-def tokenizers_dir(cache_dir: Path) -> Path:
-    return Path(cache_dir) / "tokenizers"
-
-
-def protein_vocab_path(cache_dir: Path) -> Path:
-    return tokenizers_dir(cache_dir) / "protein_vocab.json"
-
-
-def smiles_vocab_path(cache_dir: Path) -> Path:
-    return tokenizers_dir(cache_dir) / "smiles_vocab.json"
+    return structures_cache_dir(cache_dir) / key[:2] / f"{key}.pt"
 
 
 def ensure_parent(path: Path) -> None:

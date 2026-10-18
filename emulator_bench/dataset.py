@@ -1,16 +1,16 @@
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Iterable, List, Optional
 
 import math
 import pandas as pd
 import torch
 
+from emulator_bench.bench_tokenizers import pad_tokens
 from emulator_bench.common import (
     ligand_cache_path,
     normalize_sequence,
     protein_cache_path,
-    protein_sequence_cache_max_len,
     structure_cache_path,
 )
 
@@ -41,34 +41,33 @@ class _LRUStore:
 
 
 class ProteinEmbeddingStore(_LRUStore):
-    def __init__(self, cache_dir: Path, sequences: Optional[Iterable[str]] = None, preload: bool = False, max_items: int = 256, max_len: int = 2500):
+    def __init__(self, cache_dir: Path, sequences: Optional[Iterable[str]] = None, preload: bool = False, max_items: int = 256):
         super().__init__(max_items=max_items)
         self.cache_dir = Path(cache_dir)
-        self.max_len = max_len
-        self.cache_key_max_len = protein_sequence_cache_max_len(max_len)
         if preload and sequences is not None:
-            for sequence in sorted({normalize_sequence(sequence, max_len=self.cache_key_max_len) for sequence in sequences}):
+            for sequence in sorted({normalize_sequence(sequence) for sequence in sequences}):
                 self.get(sequence)
 
     def get(self, sequence: str):
-        normalized = normalize_sequence(sequence, max_len=self.cache_key_max_len)
-        path = protein_cache_path(self.cache_dir, normalized, max_len=self.cache_key_max_len)
+        normalized = normalize_sequence(sequence)
+        path = protein_cache_path(self.cache_dir, normalized)
         if not path.exists():
             raise FileNotFoundError(f"Missing cached protein payload: {path}")
         return self._get_or_load(normalized, path)
 
 
 class LigandEmbeddingStore(_LRUStore):
-    def __init__(self, cache_dir: Path, smiles_values: Optional[Iterable[str]] = None, preload: bool = False, max_items: int = 256):
+    def __init__(self, cache_dir: Path, fingerprint: str, smiles_values: Optional[Iterable[str]] = None, preload: bool = False, max_items: int = 256):
         super().__init__(max_items=max_items)
         self.cache_dir = Path(cache_dir)
+        self.fingerprint = fingerprint
         if preload and smiles_values is not None:
             for smiles in sorted({str(smiles) for smiles in smiles_values}):
                 self.get(smiles)
 
     def get(self, smiles: str):
         smiles = str(smiles).strip()
-        path = ligand_cache_path(self.cache_dir, smiles)
+        path = ligand_cache_path(self.cache_dir, smiles, self.fingerprint)
         if not path.exists():
             raise FileNotFoundError(f"Missing cached ligand payload: {path}")
         return self._get_or_load(smiles, path)
@@ -93,14 +92,6 @@ class StructureEmbeddingStore(_LRUStore):
             raise FileNotFoundError(f"Missing cached structure payload: {path}")
         cache_key = f"{structure_id}::{normalize_sequence(sequence)}"
         return self._get_or_load(cache_key, path)
-
-
-def pad_tokens(token_ids: torch.Tensor, max_length: int, pad_id: int) -> torch.Tensor:
-    token_ids = token_ids[:max_length]
-    if token_ids.numel() < max_length:
-        padding = torch.full((max_length - token_ids.numel(),), int(pad_id), dtype=torch.long)
-        token_ids = torch.cat([token_ids.long(), padding], dim=0)
-    return token_ids.long()
 
 
 class CachedDEKPDataset(torch.utils.data.Dataset):

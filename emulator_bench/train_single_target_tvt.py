@@ -3,20 +3,20 @@ import gc
 import json
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
 import torch
+from sklearn.ensemble import ExtraTreesRegressor
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -28,18 +28,15 @@ from emulator_bench.common import (
     COMMON_SMILES_COLS,
     COMMON_TARGET_COLS,
     COMMON_STRUCTURE_ID_COLS,
-    DEFAULT_BASE_DIR,
-    DEFAULT_CACHE_DIR,
     DEFAULT_FEATURES,
+    SEEDS,
     append_csv_row,
     find_first_existing_column,
     ligand_cache_path,
     load_json,
     protein_cache_path,
-    protein_sequence_cache_max_len,
     read_table,
     regression_metrics,
-    resolve_single_split_job,
     save_json,
     set_seed,
     structure_cache_path,
@@ -47,22 +44,6 @@ from emulator_bench.common import (
 )
 from emulator_bench.dataset import CachedDEKPDataset, LigandEmbeddingStore, ProteinEmbeddingStore, StructureEmbeddingStore
 from emulator_bench.modeling import MetaDecoder, graph_collate_fn
-
-
-def _resolve_amp(device: torch.device):
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return None, "fp32"
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    major, _ = torch.cuda.get_device_capability(index)
-    if major >= 8:
-        return torch.bfloat16, "bf16"
-    return torch.float16, "fp16"
-
-
-def _autocast_context(device: torch.device, amp_dtype):
-    if device.type == "cuda" and amp_dtype is not None:
-        return torch.autocast(device_type="cuda", dtype=amp_dtype)
-    return nullcontext()
 
 
 def _worker_init_fn(worker_id: int) -> None:
@@ -77,12 +58,9 @@ def _worker_init_fn(worker_id: int) -> None:
 def _resolve_columns(frame: pd.DataFrame, manifest: dict, args):
     resolved = manifest.get("resolved_columns", {})
     pdb_record_col = resolved.get("pdb_record_col") or ("pdbs" if "pdbs" in frame.columns else None)
-    manifest_structure_id = resolved.get("structure_id_col")
-    if manifest_structure_id == resolved.get("sequence_col"):
-        manifest_structure_id = None  # was a sequence fallback in the manifest, not a real structure column
-    structure_id_col = find_first_existing_column(frame, COMMON_STRUCTURE_ID_COLS, explicit=args.structure_id_col or manifest_structure_id, required=False)
-    if structure_id_col is None and pdb_record_col:
-        structure_id_col = pdb_record_col
+    structure_id_col = pdb_record_col or find_first_existing_column(
+        frame, COMMON_STRUCTURE_ID_COLS, explicit=args.structure_id_col or resolved.get("structure_id_col"), required=False
+    )
     return {
         "sequence_col": find_first_existing_column(frame, COMMON_SEQUENCE_COLS, explicit=args.sequence_col or resolved.get("sequence_col"), required=True),
         "smiles_col": find_first_existing_column(frame, COMMON_SMILES_COLS, explicit=args.smiles_col or resolved.get("smiles_col"), required=True),
@@ -119,7 +97,7 @@ def _move_batch(graph_batch, protein_tokens, smiles_tokens, features, labels, de
     return graph_batch, protein_tokens, smiles_tokens, features, labels
 
 
-def evaluate(model, loader, device, amp_dtype):
+def evaluate(model, loader, device):
     model.eval()
     mse_loss = torch.nn.MSELoss(reduction="mean")
     total_loss = 0.0
@@ -131,9 +109,8 @@ def evaluate(model, loader, device, amp_dtype):
             graph_batch, protein_tokens, smiles_tokens, features, label_tensor = _move_batch(
                 graph_batch, protein_tokens, smiles_tokens, features, label_tensor, device
             )
-            with _autocast_context(device, amp_dtype):
-                outputs = model(graph_batch, protein_tokens, smiles_tokens, features)
-                loss = mse_loss(outputs, label_tensor)
+            outputs = model(graph_batch, protein_tokens, smiles_tokens, features)
+            loss = mse_loss(outputs, label_tensor)
 
             batch_size = int(label_tensor.numel())
             total_loss += float(loss.item()) * batch_size
@@ -145,6 +122,21 @@ def evaluate(model, loader, device, amp_dtype):
     metrics = regression_metrics(labels, preds)
     metrics["loss"] = total_loss / max(1, total_examples)
     return metrics, preds, labels, metadata_rows
+
+
+def extract_latents(model, loader, device):
+    model.eval()
+    latents, labels, metadata_rows = [], [], []
+    with torch.no_grad():
+        for graph_batch, protein_tokens, smiles_tokens, features, label_tensor, metadata in loader:
+            graph_batch, protein_tokens, smiles_tokens, features, label_tensor = _move_batch(
+                graph_batch, protein_tokens, smiles_tokens, features, label_tensor, device
+            )
+            model(graph_batch, protein_tokens, smiles_tokens, features)
+            latents.append(model.encode().detach().float().cpu())
+            labels.extend(label_tensor.detach().float().cpu().tolist())
+            metadata_rows.extend(metadata)
+    return torch.cat(latents).numpy(), labels, metadata_rows
 
 
 def _save_checkpoint(path: Path, model, optimizer, epoch: int, args, manifest: dict, feature_dim_list, best_metric: float):
@@ -197,8 +189,6 @@ def _filter_missing_cache_rows(frame: pd.DataFrame, split_name: str, resolved_co
     sequence_col = resolved_columns["sequence_col"]
     protein_id_col = resolved_columns["protein_id_col"]
     structure_id_col = resolved_columns["structure_id_col"]
-    protein_max_len = int(manifest["protein_max_len"])
-    protein_cache_max_len = protein_sequence_cache_max_len(protein_max_len)
 
     keep_mask = []
     missing_protein_ids = []
@@ -214,8 +204,8 @@ def _filter_missing_cache_rows(frame: pd.DataFrame, split_name: str, resolved_co
         else:
             structure_id = str(structure_value).strip()
 
-        protein_path = protein_cache_path(cache_dir, sequence=sequence, max_len=protein_cache_max_len)
-        ligand_path = ligand_cache_path(cache_dir, smiles=smiles)
+        protein_path = protein_cache_path(cache_dir, sequence=sequence)
+        ligand_path = ligand_cache_path(cache_dir, smiles=smiles, fingerprint=manifest["trfm_fingerprint"])
         structure_path = structure_cache_path(cache_dir, structure_id=structure_id, fallback_sequence=sequence)
 
         protein_exists = protein_path.exists()
@@ -256,13 +246,10 @@ def _filter_missing_cache_rows(frame: pd.DataFrame, split_name: str, resolved_co
 
 def main():
     parser = argparse.ArgumentParser(description="Train DEKP on explicit train/val/test splits with cached features.")
-    parser.add_argument("--train_path", type=str, default=None)
-    parser.add_argument("--val_path", type=str, default=None)
-    parser.add_argument("--test_path", type=str, default=None)
-    parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR))
-    parser.add_argument("--split_group", type=str, default=None)
-    parser.add_argument("--threshold", type=str, default=None)
-    parser.add_argument("--cache_dir", type=str, default=str(DEFAULT_CACHE_DIR))
+    parser.add_argument("--train_path", type=str, required=True)
+    parser.add_argument("--val_path", type=str, required=True)
+    parser.add_argument("--test_path", type=str, required=True)
+    parser.add_argument("--cache_dir", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--task_name", type=str, default="dekp_run")
     parser.add_argument("--feature_list", type=str, default=",".join(DEFAULT_FEATURES))
@@ -271,8 +258,8 @@ def main():
     parser.add_argument("--protein_id_col", type=str, default=None)
     parser.add_argument("--structure_id_col", type=str, default=None)
     parser.add_argument("--target_col", type=str, default=None)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=3e-4)
     parser.add_argument("--hidden", type=int, default=32)
@@ -288,17 +275,9 @@ def main():
     parser.add_argument("--preload_ligands", action="store_true")
     parser.add_argument("--preload_structures", action="store_true")
     parser.add_argument("--cache_items", type=int, default=64)
-    parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--seed", type=int, default=SEEDS[0])
     parser.add_argument("--compile_model", action="store_true")
     args = parser.parse_args()
-
-    if args.train_path is None or args.val_path is None or args.test_path is None:
-        if not args.split_group:
-            raise ValueError("Provide either explicit --train_path/--val_path/--test_path or --split_group.")
-        job = resolve_single_split_job(Path(args.base_dir), args.split_group, args.threshold)
-        args.train_path = job["train_path"]
-        args.val_path = job["val_path"]
-        args.test_path = job["test_path"]
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -319,12 +298,16 @@ def main():
     original_val_rows = len(val_df)
     original_test_rows = len(test_df)
 
+    # Original DEKP preprocessing (pretrain.py): drop placeholder labels and multi-component SMILES.
+    # Applied to train only so every baseline keeps the same val and test rows.
+    train_df = train_df[(train_df["value"] != 1e-8) & ~train_df[resolved_columns["smiles_col"]].str.contains(".", regex=False)]
+    preprocessed_train = train_df
     train_df = _filter_missing_cache_rows(train_df, "train", resolved_columns, cache_dir, manifest)
     val_df = _filter_missing_cache_rows(val_df, "val", resolved_columns, cache_dir, manifest)
     test_df = _filter_missing_cache_rows(test_df, "test", resolved_columns, cache_dir, manifest)
 
     filtered_total = len(train_df) + len(val_df) + len(test_df)
-    original_total = original_train_rows + original_val_rows + original_test_rows
+    original_total = len(preprocessed_train) + original_val_rows + original_test_rows
     removed_total = int(original_total - filtered_total)
     removed_total_pct = (100.0 * removed_total / original_total) if original_total else 0.0
     print(
@@ -345,24 +328,26 @@ def main():
             f"After dropping rows with missing cache entries, split sizes are train={len(train_df)}, val={len(val_df)}, test={len(test_df)}."
         )
 
+    # As in DEKP pretrain.py: token padding length and positional-embedding size are the longest raw
+    # sequence and SMILES of the run.
+    run_frames = (train_df, val_df, test_df)
+    protein_max_len = max(int(frame[resolved_columns["sequence_col"]].astype(str).str.len().max()) for frame in run_frames)
+    smiles_max_len = max(int(frame[resolved_columns["smiles_col"]].astype(str).str.len().max()) for frame in run_frames)
+
     set_seed(args.seed)
     device = torch.device(args.device)
     if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        torch.set_float32_matmul_precision("high")
-    amp_dtype, amp_name = _resolve_amp(device)
 
     protein_store = ProteinEmbeddingStore(
         cache_dir=cache_dir,
         sequences=train_df[resolved_columns["sequence_col"]].tolist() if args.preload_proteins else None,
         preload=args.preload_proteins,
         max_items=args.cache_items,
-        max_len=int(manifest["protein_max_len"]),
     )
     ligand_store = LigandEmbeddingStore(
         cache_dir=cache_dir,
+        fingerprint=manifest["trfm_fingerprint"],
         smiles_values=train_df[resolved_columns["smiles_col"]].tolist() if args.preload_ligands else None,
         preload=args.preload_ligands,
         max_items=args.cache_items,
@@ -392,8 +377,8 @@ def main():
         "protein_id_col": resolved_columns["protein_id_col"],
         "structure_id_col": resolved_columns["structure_id_col"],
         "target_col": resolved_columns["target_col"],
-        "protein_max_len": int(manifest["protein_max_len"]),
-        "smiles_max_len": int(manifest["smiles_max_len"]),
+        "protein_max_len": protein_max_len,
+        "smiles_max_len": smiles_max_len,
         "protein_pad_id": int(manifest["protein_pad_id"]),
         "smiles_pad_id": int(manifest["smiles_pad_id"]),
     }
@@ -412,8 +397,8 @@ def main():
         feature_dim_list=feature_dim_list,
         hidden=args.hidden,
         num_layers=args.num_layers,
-        protein_len=int(manifest["protein_max_len"]),
-        smi_len=int(manifest["smiles_max_len"]),
+        protein_len=protein_max_len,
+        smi_len=smiles_max_len,
         dropout=args.dropout,
         kernel_size=args.kernel_size,
     ).to(device)
@@ -422,11 +407,6 @@ def main():
 
     criterion = torch.nn.MSELoss(reduction="mean")
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler_enabled = device.type == "cuda" and amp_dtype == torch.float16
-    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
-    else:
-        scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
     started = time.time()
     log_path = out_dir / "logfile.csv"
@@ -443,16 +423,10 @@ def main():
                     graph_batch, protein_tokens, smiles_tokens, features, labels, device
                 )
                 optimizer.zero_grad(set_to_none=True)
-                with _autocast_context(device, amp_dtype):
-                    outputs = model(graph_batch, protein_tokens, smiles_tokens, features)
-                    loss = criterion(outputs, labels)
-                if scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    optimizer.step()
+                outputs = model(graph_batch, protein_tokens, smiles_tokens, features)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
                 batch_size = int(labels.numel())
                 train_loss_sum += float(loss.item()) * batch_size
                 train_examples += batch_size
@@ -476,23 +450,39 @@ def main():
             epoch_bar.update(1)
             gc.collect()
 
-    val_metrics, val_preds, val_labels, val_metadata = evaluate(model, val_loader, device=device, amp_dtype=amp_dtype)
-    test_metrics, test_preds, test_labels, test_metadata = evaluate(model, test_loader, device=device, amp_dtype=amp_dtype)
+    # DEKP final predictor: Extra Trees (sklearn defaults, seeded) fitted on the trained network's latent vector.
+    nn_val_metrics, _, _, _ = evaluate(model, val_loader, device=device)
+    nn_test_metrics, _, _, _ = evaluate(model, test_loader, device=device)
+    train_eval_loader = _make_loader(train_ds, batch_size=args.batch_size, shuffle=False, args=args)
+    train_x, train_y, _ = extract_latents(model, train_eval_loader, device)
+    val_x, val_labels, val_metadata = extract_latents(model, val_loader, device)
+    test_x, test_labels, test_metadata = extract_latents(model, test_loader, device)
+    trees = ExtraTreesRegressor(n_jobs=-1, random_state=args.seed).fit(train_x, train_y)
+    val_preds = trees.predict(val_x).tolist()
+    test_preds = trees.predict(test_x).tolist()
+    val_metrics = regression_metrics(val_labels, val_preds)
+    test_metrics = regression_metrics(test_labels, test_preds)
     final_summary = {
         "task_name": args.task_name,
         "seed": args.seed,
-        "amp_mode": amp_name,
         "elapsed_seconds": time.time() - started,
         "feature_list": ",".join(args.feature_list),
+        "orig_train_rows": original_train_rows,
+        "orig_val_rows": original_val_rows,
+        "orig_test_rows": original_test_rows,
         "train_rows": len(train_df),
         "val_rows": len(val_df),
         "test_rows": len(test_df),
         **{f"val_{key}": value for key, value in val_metrics.items()},
         **{f"test_{key}": value for key, value in test_metrics.items()},
+        **{f"nn_val_{key}": value for key, value in nn_val_metrics.items()},
+        **{f"nn_test_{key}": value for key, value in nn_test_metrics.items()},
     }
 
     write_csv(out_dir / "final_results_val.csv", [val_metrics])
     write_csv(out_dir / "final_results_test.csv", [test_metrics])
+    write_csv(out_dir / "final_results_val_nn.csv", [nn_val_metrics])
+    write_csv(out_dir / "final_results_test_nn.csv", [nn_test_metrics])
     _write_prediction_csv(out_dir / "pred_label_val.csv", val_preds, val_labels, val_metadata)
     _write_prediction_csv(out_dir / "pred_label_test.csv", test_preds, test_labels, test_metadata)
     write_csv(out_dir / "run_summary.csv", [final_summary])

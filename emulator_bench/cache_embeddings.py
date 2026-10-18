@@ -10,27 +10,27 @@ import numpy as np
 import pandas as pd
 import torch
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import (
+    CACHE_VERSION,
     COMMON_CID_COLS,
     COMMON_PROTEIN_ID_COLS,
     COMMON_SEQUENCE_COLS,
     COMMON_SMILES_COLS,
     COMMON_STRUCTURE_ID_COLS,
-    DEFAULT_BASE_DIR,
-    DEFAULT_CACHE_DIR,
     DEFAULT_FEATURES,
     DEFAULT_SPLIT_GROUPS,
+    TASKS,
     apply_manifest_paths_to_jobs,
     canonical_pdb_identity,
     discover_split_jobs,
@@ -39,19 +39,19 @@ from emulator_bench.common import (
     normalize_threshold_args,
     protein_cache_path,
     ligand_cache_path,
+    trfm_column_map,
+    trfm_fingerprint,
     save_json,
     structure_cache_path,
-    tokenizers_dir,
-    protein_vocab_path,
+    structures_cache_dir,
+    task_paths,
     read_table,
-    smiles_vocab_path,
 )
 from emulator_bench.feature_pipeline import (
     build_graph_from_pdb,
     build_graph_from_array,
-    build_prot_t5_batches,
     compute_dssp_feature,
-    embed_prot_t5_batch,
+    embed_prot_t5,
     embed_smiles_trfm_batch,
     load_legacy_feature_pickles,
     load_prot_t5,
@@ -59,10 +59,7 @@ from emulator_bench.feature_pipeline import (
     parse_pdb_to_array,
     resolve_legacy_feature,
 )
-from emulator_bench.bench_tokenizers import ProteinSequenceTokenizer, RegexSmilesTokenizer
-
-
-DEFAULT_DATASET_DF_PATH = Path("~/github/EMULaToR/data/processed/baselines/DEKP/km_kinetic_params_3d.parquet").expanduser()
+from emulator_bench.bench_tokenizers import load_protein_tokenizer, load_smiles_tokenizer, protein_token_ids, smiles_token_ids
 
 
 def _log(message: str, enabled: bool = True) -> None:
@@ -132,126 +129,21 @@ def _build_pdb_indexes(args) -> dict:
                     if current is None or version > current[0]:
                         indexes["alphafold"][uniprot_id] = (version, path)
 
-    if args.esm3_pdb_dir:
-        pdb_dir = Path(args.esm3_pdb_dir).expanduser()
+    if args.esm_pdb_dir:
+        pdb_dir = Path(args.esm_pdb_dir).expanduser()
         if pdb_dir.exists():
-            for path in pdb_dir.glob("ESM3-open-small-*.pdb"):
-                key = path.name[len("ESM3-open-small-") : -len(".pdb")]
+            for path in pdb_dir.glob("ESMFold2-*.pdb"):
+                key = path.name[len("ESMFold2-") : -len(".pdb")]
                 indexes["esm3"][key] = path
 
     return indexes
 
 
 def _build_existing_structure_cache_index(cache_dir: Path) -> set[str]:
-    structures_dir = Path(cache_dir) / "structures"
+    structures_dir = structures_cache_dir(cache_dir)
     if not structures_dir.exists():
         return set()
     return {str(path) for path in structures_dir.rglob("*.pt")}
-
-
-def _iter_unique_rows_from_frame(frame: pd.DataFrame, column_names: dict):
-    sequence_col = column_names["sequence_col"]
-    smiles_col = column_names["smiles_col"]
-    protein_id_col = column_names.get("protein_id_col")
-    structure_id_col = column_names.get("structure_id_col")
-    cid_col = column_names.get("cid_col")
-    pdb_type_col = column_names.get("pdb_type_col")
-    pdb_source_col = column_names.get("pdb_source_col")
-    pdb_record_col = column_names.get("pdb_record_col")
-    structure_path_col = column_names.get("structure_path_col")
-
-    working = pd.DataFrame(index=frame.index)
-    working["sequence"] = _normalize_series(frame[sequence_col]).map(normalize_sequence)
-    working["smiles"] = _normalize_series(frame[smiles_col])
-
-    if protein_id_col and protein_id_col in frame.columns:
-        working["protein_id"] = _normalize_series(frame[protein_id_col])
-    else:
-        working["protein_id"] = working["sequence"]
-
-    if structure_id_col and structure_id_col in frame.columns:
-        working["structure_id"] = _normalize_series(frame[structure_id_col])
-    elif pdb_record_col and pdb_record_col in frame.columns:
-        working["structure_id"] = _normalize_series(frame[pdb_record_col])
-    else:
-        working["structure_id"] = working["protein_id"]
-
-    if cid_col and cid_col in frame.columns:
-        working["cid"] = frame[cid_col]
-    else:
-        working["cid"] = None
-
-    if pdb_type_col and pdb_type_col in frame.columns:
-        working["pdb_type"] = _normalize_series(frame[pdb_type_col]).str.lower()
-    else:
-        working["pdb_type"] = ""
-
-    if pdb_source_col and pdb_source_col in frame.columns:
-        working["pdb_source"] = _normalize_series(frame[pdb_source_col]).str.lower()
-    else:
-        working["pdb_source"] = ""
-
-    if pdb_record_col and pdb_record_col in frame.columns:
-        working["pdb_record"] = _normalize_series(frame[pdb_record_col])
-    else:
-        working["pdb_record"] = working["structure_id"]
-
-    if structure_path_col and structure_path_col in frame.columns:
-        working["structure_path"] = _normalize_series(frame[structure_path_col])
-    else:
-        working["structure_path"] = ""
-
-    working["pdb_key"] = working["pdb_record"].where(working["pdb_record"] != "", working["structure_id"])
-    working = working[working["sequence"] != ""].copy()
-    working = working[working["smiles"] != ""].copy()
-    working = working[working["pdb_key"] != ""].copy()
-
-    unique_sequences = (
-        working.drop_duplicates(subset=["sequence"], keep="first")[["sequence", "protein_id", "structure_id"]]
-        .to_dict("records")
-    )
-    unique_smiles = working.drop_duplicates(subset=["smiles"], keep="first")[["smiles", "cid"]].to_dict("records")
-    unique_structures = (
-        working.drop_duplicates(subset=["pdb_key"], keep="first")[
-            ["pdb_key", "sequence", "protein_id", "pdb_type", "pdb_source", "pdb_record", "structure_id", "structure_path"]
-        ]
-        .to_dict("records")
-    )
-
-    unique_sequences_map = {
-        entry["sequence"]: {
-            "sequence": entry["sequence"],
-            "protein_id": entry["protein_id"] or entry["sequence"],
-            "structure_id": entry["structure_id"] or entry["sequence"],
-        }
-        for entry in unique_sequences
-    }
-    unique_smiles_map = {
-        entry["smiles"]: {
-            "smiles": entry["smiles"],
-            "cid": entry["cid"],
-        }
-        for entry in unique_smiles
-    }
-    unique_structures_map = {
-        entry["pdb_key"]: {
-            "structure_id": entry["pdb_key"],
-            "protein_id": entry["protein_id"] or entry["sequence"],
-            "sequence": entry["sequence"],
-            "pdb_type": entry["pdb_type"],
-            "pdb_source": entry["pdb_source"],
-            "pdb_record": entry["pdb_record"] or entry["structure_id"] or entry["pdb_key"],
-            "original_structure_id": entry["structure_id"] or entry["pdb_record"] or entry["pdb_key"],
-            "structure_path": entry.get("structure_path") or "",
-        }
-        for entry in unique_structures
-    }
-
-    protein_len_max = working["sequence"].str.len().max()
-    smiles_len_max = working["smiles"].str.len().max()
-    max_protein_len = (int(protein_len_max) if pd.notna(protein_len_max) else 0) + 2
-    max_smiles_len = (int(smiles_len_max) if pd.notna(smiles_len_max) else 0) + 2
-    return unique_sequences_map, unique_smiles_map, unique_structures_map, max_protein_len, max_smiles_len
 
 
 def _scan_split_file(payload: dict) -> dict:
@@ -269,8 +161,6 @@ def _scan_split_file(payload: dict) -> dict:
     unique_sequences = {}
     unique_smiles = {}
     unique_structures = {}
-    max_protein_len = 0
-    max_smiles_len = 0
 
     for _, row in frame.iterrows():
         sequence = normalize_sequence(row[sequence_col])
@@ -297,6 +187,7 @@ def _scan_split_file(payload: dict) -> dict:
         if sequence not in unique_sequences:
             unique_sequences[sequence] = {
                 "sequence": sequence,
+                "raw_sequence": str(row[sequence_col]),
                 "protein_id": protein_id,
                 "structure_id": structure_id,
             }
@@ -318,9 +209,6 @@ def _scan_split_file(payload: dict) -> dict:
                 "structure_path": structure_path,
             }
 
-        max_protein_len = max(max_protein_len, len(sequence) + 2)
-        max_smiles_len = max(max_smiles_len, len(smiles) + 2)
-
     return {
         "path": payload["path"],
         "split_group": payload["split_group"],
@@ -329,8 +217,6 @@ def _scan_split_file(payload: dict) -> dict:
         "unique_sequences": unique_sequences,
         "unique_smiles": unique_smiles,
         "unique_structures": unique_structures,
-        "max_protein_len": max_protein_len,
-        "max_smiles_len": max_smiles_len,
     }
 
 
@@ -394,7 +280,6 @@ def _resolve_pdb_path(entry: dict, args) -> Path | None:
 def _build_graph_worker(payload: dict) -> dict:
     graph = build_graph_from_pdb(
         Path(payload["pdb_path"]),
-        nneighbor=int(payload["graph_neighbors"]),
         atom_type=str(payload["graph_atom_type"]),
         device="cpu",
     )
@@ -407,7 +292,6 @@ def _build_graph_worker(payload: dict) -> dict:
 def _parse_pdb_worker(payload: dict) -> dict:
     pdb_array = parse_pdb_to_array(
         Path(payload["pdb_path"]),
-        nneighbor=int(payload["graph_neighbors"]),
         atom_type=str(payload["graph_atom_type"]),
     )
     return {
@@ -489,13 +373,11 @@ def _iter_unique_rows(jobs, column_names):
             )
 
     if not tasks:
-        return {}, {}, {}, 0, 0
+        return {}, {}, {}
 
     unique_sequences = {}
     unique_smiles = {}
     unique_structures = {}
-    max_protein_len = 0
-    max_smiles_len = 0
 
     max_workers = min(len(tasks), os.cpu_count() or 1)
     _log(f"Scanning {len(tasks)} split files with up to {max_workers} worker processes", True)
@@ -506,10 +388,8 @@ def _iter_unique_rows(jobs, column_names):
             unique_sequences.update(result["unique_sequences"])
             unique_smiles.update(result["unique_smiles"])
             unique_structures.update(result["unique_structures"])
-            max_protein_len = max(max_protein_len, result["max_protein_len"])
-            max_smiles_len = max(max_smiles_len, result["max_smiles_len"])
 
-    return unique_sequences, unique_smiles, unique_structures, max_protein_len, max_smiles_len
+    return unique_sequences, unique_smiles, unique_structures
 
 
 def _resolve_columns(frame, args):
@@ -526,18 +406,18 @@ def _resolve_columns(frame, args):
     }
 
 
-def _save_protein_payloads(unique_sequences, cache_dir: Path, protein_tokenizer: ProteinSequenceTokenizer, args, legacy):
+def _save_protein_payloads(unique_sequences, cache_dir: Path, protein_tokenizer, args, legacy):
     dtype = torch.float16 if args.cache_dtype == "float16" else torch.float32
     pending_t5 = []
     feature_dims = {}
     written = 0
     _log(
-        f"Protein cache: {len(unique_sequences)} unique sequences | token max_len={args.protein_max_len} | dtype={args.cache_dtype}",
+        f"Protein cache: {len(unique_sequences)} unique sequences | dtype={args.cache_dtype}",
         args.verbose,
     )
 
     for entry in unique_sequences.values():
-        path = protein_cache_path(cache_dir, entry["sequence"], max_len=args.protein_max_len)
+        path = protein_cache_path(cache_dir, entry["sequence"])
         if path.exists() and not args.overwrite:
             if "t5" in args.feature_list and "t5" not in feature_dims:
                 payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -549,10 +429,7 @@ def _save_protein_payloads(unique_sequences, cache_dir: Path, protein_tokenizer:
                 payload = {
                     "sequence": entry["sequence"],
                     "protein_id": entry["protein_id"],
-                    "token_ids": torch.tensor(
-                        protein_tokenizer.encode(entry["sequence"], max_length=args.protein_max_len, add_special_tokens=True),
-                        dtype=torch.long,
-                    ),
+                    "token_ids": torch.tensor(protein_token_ids(protein_tokenizer, entry["raw_sequence"]), dtype=torch.long),
                 }
                 tensor = _coerce_feature_tensor(legacy_value, dtype=dtype)
                 payload["t5"] = tensor
@@ -563,6 +440,7 @@ def _save_protein_payloads(unique_sequences, cache_dir: Path, protein_tokenizer:
                 pending_t5.append(
                     {
                         "sequence": entry["sequence"],
+                        "raw_sequence": entry["raw_sequence"],
                         "protein_id": entry["protein_id"],
                         "path": path,
                     }
@@ -572,10 +450,7 @@ def _save_protein_payloads(unique_sequences, cache_dir: Path, protein_tokenizer:
             payload = {
                 "sequence": entry["sequence"],
                 "protein_id": entry["protein_id"],
-                "token_ids": torch.tensor(
-                    protein_tokenizer.encode(entry["sequence"], max_length=args.protein_max_len, add_special_tokens=True),
-                    dtype=torch.long,
-                ),
+                "token_ids": torch.tensor(protein_token_ids(protein_tokenizer, entry["raw_sequence"]), dtype=torch.long),
             }
             _atomic_torch_save(path, payload)
             written += 1
@@ -584,64 +459,38 @@ def _save_protein_payloads(unique_sequences, cache_dir: Path, protein_tokenizer:
         device = torch.device(args.device)
         _log(f"ProtT5 phase: loading model on {device}", args.verbose)
         model, tokenizer = load_prot_t5(args.prot_t5_model, device=device)
-        sequences = [item["sequence"] for item in pending_t5]
-        _log(f"ProtT5 phase: {len(sequences)} sequences require direct computation", args.verbose)
-        _log("ProtT5 phase: precomputing protein token ids", args.verbose)
-        token_id_lookup = {}
-        for item in progress(pending_t5, desc="Encoding protein tokens", unit="seq"):
-            token_id_lookup[item["sequence"]] = torch.tensor(
-                protein_tokenizer.encode(item["sequence"], max_length=args.protein_max_len, add_special_tokens=True),
-                dtype=torch.long,
-            )
-        batches = build_prot_t5_batches(
-            sequences,
-            max_residues=args.prot_t5_max_residues,
-            max_seq_len=args.protein_max_len,
-            max_batch=args.prot_t5_max_batch,
-        )
-        _log(f"ProtT5 phase: {len(batches)} batches", args.verbose)
-        batch_lookup = {item["sequence"]: item for item in pending_t5}
-        for batch in progress(batches, desc="Caching ProtT5", unit="batch"):
-            embedded = embed_prot_t5_batch(model, tokenizer, batch, device)
-            for sequence in batch:
-                item = batch_lookup[sequence]
-                payload = {
-                    "sequence": sequence,
-                    "protein_id": item["protein_id"],
-                    "token_ids": token_id_lookup[sequence],
-                }
-                tensor = torch.as_tensor(embedded[sequence], dtype=dtype)
-                payload["t5"] = tensor
-                feature_dims["t5"] = int(tensor.numel())
-                _atomic_torch_save(item["path"], payload)
-                written += 1
-                del payload
-                del tensor
-            del embedded
+        _log(f"ProtT5 phase: {len(pending_t5)} sequences require direct computation", args.verbose)
+        for item in progress(pending_t5, desc="Caching ProtT5", unit="seq"):
+            tensor = torch.as_tensor(embed_prot_t5(model, tokenizer, item["raw_sequence"], device), dtype=dtype)
+            payload = {
+                "sequence": item["sequence"],
+                "protein_id": item["protein_id"],
+                "token_ids": torch.tensor(protein_token_ids(protein_tokenizer, item["raw_sequence"]), dtype=torch.long),
+                "t5": tensor,
+            }
+            feature_dims["t5"] = int(tensor.numel())
+            _atomic_torch_save(item["path"], payload)
+            written += 1
         del model
         del tokenizer
-        del token_id_lookup
-        del batch_lookup
-        del batches
-        del sequences
         _cleanup_torch_memory(device)
 
     return written, feature_dims
 
 
-def _save_ligand_payloads(unique_smiles, cache_dir: Path, smiles_tokenizer: RegexSmilesTokenizer, args, legacy):
+def _save_ligand_payloads(unique_smiles, cache_dir: Path, smiles_tokenizer, args, legacy, trfm_columns, fingerprint):
     dtype = torch.float16 if args.cache_dtype == "float16" else torch.float32
     pending_trfm = []
     pending_lookup = {}
     feature_dims = {}
     written = 0
     _log(
-        f"Ligand cache: {len(unique_smiles)} unique SMILES | token max_len={args.smiles_max_len} | dtype={args.cache_dtype}",
+        f"Ligand cache: {len(unique_smiles)} unique SMILES | dtype={args.cache_dtype}",
         args.verbose,
     )
 
     for entry in unique_smiles.values():
-        path = ligand_cache_path(cache_dir, entry["smiles"])
+        path = ligand_cache_path(cache_dir, entry["smiles"], fingerprint)
         if path.exists() and not args.overwrite:
             if (
                 ("trfm" in args.feature_list and "trfm" not in feature_dims)
@@ -663,10 +512,7 @@ def _save_ligand_payloads(unique_smiles, cache_dir: Path, smiles_tokenizer: Rege
                 payload = {
                     "smiles": entry["smiles"],
                     "cid": entry.get("cid"),
-                    "token_ids": torch.tensor(
-                        smiles_tokenizer.encode(entry["smiles"], max_length=args.smiles_max_len, add_special_tokens=True),
-                        dtype=torch.long,
-                    ),
+                    "token_ids": torch.tensor(smiles_token_ids(smiles_tokenizer, entry["smiles"]), dtype=torch.long),
                 }
                 tensor = _coerce_feature_tensor(legacy_value, dtype=dtype)
                 payload["trfm"] = tensor
@@ -694,10 +540,7 @@ def _save_ligand_payloads(unique_smiles, cache_dir: Path, smiles_tokenizer: Rege
                 payload = {
                     "smiles": entry["smiles"],
                     "cid": entry.get("cid"),
-                    "token_ids": torch.tensor(
-                        smiles_tokenizer.encode(entry["smiles"], max_length=args.smiles_max_len, add_special_tokens=True),
-                        dtype=torch.long,
-                    ),
+                    "token_ids": torch.tensor(smiles_token_ids(smiles_tokenizer, entry["smiles"]), dtype=torch.long),
                 }
             tensor = _coerce_feature_tensor(legacy_value, dtype=dtype)
             payload["molformer"] = tensor
@@ -706,10 +549,7 @@ def _save_ligand_payloads(unique_smiles, cache_dir: Path, smiles_tokenizer: Rege
             payload = {
                 "smiles": entry["smiles"],
                 "cid": entry.get("cid"),
-                "token_ids": torch.tensor(
-                    smiles_tokenizer.encode(entry["smiles"], max_length=args.smiles_max_len, add_special_tokens=True),
-                    dtype=torch.long,
-                ),
+                "token_ids": torch.tensor(smiles_token_ids(smiles_tokenizer, entry["smiles"]), dtype=torch.long),
             }
         if payload is not None and ("trfm" not in args.feature_list or "trfm" in payload):
             _atomic_torch_save(path, payload)
@@ -727,16 +567,14 @@ def _save_ligand_payloads(unique_smiles, cache_dir: Path, smiles_tokenizer: Rege
         _log(f"SMILES Transformer phase: {len(smiles_values)} SMILES require direct computation", args.verbose)
         for start in progress(range(0, len(smiles_values), args.trfm_batch_size), desc="Caching TRFM", unit="batch"):
             batch_smiles = smiles_values[start : start + args.trfm_batch_size]
-            embedded = embed_smiles_trfm_batch(batch_smiles, model=model, vocab=vocab, device=device)
+            columns = [trfm_columns.get(smiles, 0) for smiles in batch_smiles]
+            embedded = embed_smiles_trfm_batch(batch_smiles, columns, model=model, vocab=vocab, device=device)
             for smiles in batch_smiles:
                 item = pending_lookup[smiles]
                 payload = {
                     "smiles": smiles,
                     "cid": item["cid"],
-                    "token_ids": torch.tensor(
-                        smiles_tokenizer.encode(smiles, max_length=args.smiles_max_len, add_special_tokens=True),
-                        dtype=torch.long,
-                    ),
+                    "token_ids": torch.tensor(smiles_token_ids(smiles_tokenizer, smiles), dtype=torch.long),
                 }
                 tensor = torch.as_tensor(embedded[smiles], dtype=dtype)
                 payload["trfm"] = tensor
@@ -797,7 +635,6 @@ def _save_structure_payloads(unique_structures, cache_dir: Path, args, legacy):
                 {
                     "structure_key": entry["structure_id"],
                     "pdb_path": str(pdb_path),
-                    "graph_neighbors": args.graph_neighbors,
                     "graph_atom_type": args.graph_atom_type,
                     "path": path,
                     "entry": entry,
@@ -827,7 +664,7 @@ def _save_structure_payloads(unique_structures, cache_dir: Path, args, legacy):
                         pending[future] = task
 
                 submit_until_full()
-                with progress(total=len(graph_tasks), desc="Building structure graphs", unit="structure") as progress:
+                with progress(total=len(graph_tasks), desc="Building structure graphs", unit="structure") as graph_bar:
                     while pending:
                         future = next(as_completed(list(pending.keys())))
                         task = pending.pop(future)
@@ -836,7 +673,6 @@ def _save_structure_payloads(unique_structures, cache_dir: Path, args, legacy):
                             payload = _make_structure_payload(task["entry"])
                             graph = build_graph_from_array(
                                 result["pdb_array"],
-                                nneighbor=args.graph_neighbors,
                                 device=graph_device,
                             )
                             payload["graph"] = graph
@@ -851,7 +687,7 @@ def _save_structure_payloads(unique_structures, cache_dir: Path, args, legacy):
                             print(f"Skipping structure `{task['entry']['structure_id']}` because graph build failed for {task['pdb_path']}: {exc}", flush=True)
                         processed += 1
                         _maybe_cleanup_torch_memory(processed, cleanup_interval, graph_device)
-                        progress.update(1)
+                        graph_bar.update(1)
                         submit_until_full()
             _cleanup_torch_memory(graph_device)
         else:
@@ -881,10 +717,10 @@ def _save_structure_payloads(unique_structures, cache_dir: Path, args, legacy):
 
 def main():
     parser = argparse.ArgumentParser(description="Build reusable DEKP caches for EMULaToR split retraining.")
-    parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR))
-    parser.add_argument("--cache_dir", type=str, default=str(DEFAULT_CACHE_DIR))
+    parser.add_argument("--task", choices=TASKS, default="km")
+    parser.add_argument("--base_dir", type=str, default=None)
+    parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--manifests_dir", type=str, default=None)
-    parser.add_argument("--dataset_df_path", type=str, default=str(DEFAULT_DATASET_DF_PATH))
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
     parser.add_argument("--threshold", type=str, default=None)
     parser.add_argument("--thresholds", nargs="+", default=None)
@@ -900,20 +736,15 @@ def main():
     parser.add_argument("--legacy_feature_dir", type=str, default=None)
     parser.add_argument("--experimental_pdb_dir", type=str, default=None)
     parser.add_argument("--alphafold_pdb_dir", type=str, default=None)
-    parser.add_argument("--esm3_pdb_dir", type=str, default=None)
+    parser.add_argument("--esm_pdb_dir", type=str, default=None)
     parser.add_argument("--pdb_suffix", type=str, default=".pdb")
     parser.add_argument("--prot_t5_model", type=str, default="Rostlab/prot_t5_xl_uniref50")
     parser.add_argument("--trfm_weights_path", type=str, default=None)
     parser.add_argument("--trfm_vocab_path", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--graph_device", type=str, default=None)
-    parser.add_argument("--cache_dtype", choices=["float16", "float32"], default="float16")
-    parser.add_argument("--protein_max_len", type=int, default=2500)
-    parser.add_argument("--smiles_max_len", type=int, default=512)
-    parser.add_argument("--prot_t5_max_residues", type=int, default=4000)
-    parser.add_argument("--prot_t5_max_batch", type=int, default=8)
+    parser.add_argument("--cache_dtype", choices=["float16", "float32"], default="float32")
     parser.add_argument("--trfm_batch_size", type=int, default=256)
-    parser.add_argument("--graph_neighbors", type=int, default=32)
     parser.add_argument("--graph_atom_type", type=str, default="CA")
     parser.add_argument("--graph_parse_workers", type=int, default=None)
     parser.add_argument("--graph_prefetch", type=int, default=None)
@@ -924,9 +755,10 @@ def main():
     args = parser.parse_args()
     args.verbose = True
 
-    args.base_dir = Path(args.base_dir).expanduser()
-    args.cache_dir = Path(args.cache_dir).expanduser()
-    args.manifests_dir = Path(args.manifests_dir).expanduser() if args.manifests_dir else None
+    paths = task_paths(args.task)
+    args.base_dir = Path(args.base_dir or paths["base_dir"]).expanduser()
+    args.cache_dir = Path(args.cache_dir or paths["cache_dir"]).expanduser()
+    args.manifests_dir = Path(args.manifests_dir or paths["manifests_dir"]).expanduser()
     args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
     args.feature_list = [item.strip() for item in args.feature_list.split(",") if item.strip()]
     args.graph_device = args.graph_device or args.device
@@ -947,53 +779,24 @@ def main():
     args._pdb_indexes = _build_pdb_indexes(args)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_df_path = Path(args.dataset_df_path).expanduser()
-    jobs = []
-    use_manifests = args.manifests_dir is not None
-    use_full_dataset = dataset_df_path.exists() and not use_manifests
-    if use_full_dataset:
-        _log(f"Loading full dataset dataframe from {dataset_df_path}", args.verbose)
-        frame = pd.read_parquet(dataset_df_path, columns=["sequence", "smiles", "pdbs", "pdb_type", "pdb_source"])
-        _log(f"Loaded full frame with {len(frame)} rows and columns={frame.columns.tolist()}", args.verbose)
-        column_names = {
-            "sequence_col": "sequence",
-            "smiles_col": "smiles",
-            "protein_id_col": "sequence",
-            "structure_id_col": "pdbs" if "pdbs" in frame.columns else "sequence",
-            "cid_col": None,
-            "pdb_type_col": "pdb_type" if "pdb_type" in frame.columns else None,
-            "pdb_source_col": "pdb_source" if "pdb_source" in frame.columns else None,
-            "pdb_record_col": "pdbs" if "pdbs" in frame.columns else None,
-            "structure_path_col": None,
-        }
-    else:
-        jobs = discover_split_jobs(args.base_dir, split_groups=args.split_groups, thresholds=args.thresholds)
-        if not jobs:
-            raise FileNotFoundError(f"No split jobs discovered in {args.base_dir} and no dataset_df_path found at {dataset_df_path}")
-        if use_manifests:
-            jobs = apply_manifest_paths_to_jobs(jobs, args.manifests_dir, require=True)
-            _log(f"Using prepared manifests from {args.manifests_dir}", args.verbose)
-        _log(f"Discovered {len(jobs)} split jobs in {args.base_dir} for groups={args.split_groups} and thresholds={args.thresholds}", args.verbose)
-        sample_frame = read_table(Path(jobs[0]["train_path"]))
-        _log(f"Sample frame columns: {sample_frame.columns.tolist()}", args.verbose)
-        column_names = _resolve_columns(sample_frame, args)
-        if column_names["protein_id_col"] is None:
-            column_names["protein_id_col"] = column_names["sequence_col"]
-        if column_names["structure_id_col"] is None:
-            column_names["structure_id_col"] = column_names["pdb_record_col"] or column_names["protein_id_col"]
-        _log(f"Resolved column names: {column_names}", args.verbose)
+    jobs = discover_split_jobs(args.base_dir, split_groups=args.split_groups, thresholds=args.thresholds)
+    if not jobs:
+        raise FileNotFoundError(f"No split jobs discovered in {args.base_dir}")
+    jobs = apply_manifest_paths_to_jobs(jobs, args.manifests_dir, require=True)
+    _log(f"Discovered {len(jobs)} split jobs in {args.base_dir} for groups={args.split_groups} and thresholds={args.thresholds}", args.verbose)
+    sample_frame = read_table(Path(jobs[0]["train_path"]))
+    _log(f"Sample frame columns: {sample_frame.columns.tolist()}", args.verbose)
+    column_names = _resolve_columns(sample_frame, args)
+    if column_names["protein_id_col"] is None:
+        column_names["protein_id_col"] = column_names["sequence_col"]
+    if column_names["structure_id_col"] is None:
+        column_names["structure_id_col"] = column_names["pdb_record_col"] or column_names["protein_id_col"]
+    _log(f"Resolved column names: {column_names}", args.verbose)
 
     started = time.time()
-    if use_full_dataset:
-        unique_sequences, unique_smiles, unique_structures, max_protein_len, max_smiles_len = _iter_unique_rows_from_frame(frame, column_names)
-        del frame
-        gc.collect()
-    else:
-        unique_sequences, unique_smiles, unique_structures, max_protein_len, max_smiles_len = _iter_unique_rows(jobs, column_names)
-    args.protein_max_len = max(args.protein_max_len, max_protein_len)
-    args.smiles_max_len = max(args.smiles_max_len, max_smiles_len)
+    unique_sequences, unique_smiles, unique_structures = _iter_unique_rows(jobs, column_names)
     _log(
-        f"Discovered {len(jobs) if jobs else 1} data source(s) | {len(unique_sequences)} sequences | {len(unique_smiles)} smiles | {len(unique_structures)} structures",
+        f"Discovered {len(jobs)} split job(s) | {len(unique_sequences)} sequences | {len(unique_smiles)} smiles | {len(unique_structures)} structures",
         args.verbose,
     )
     _log(f"CUDA available={torch.cuda.is_available()} | selected device={args.device}", args.verbose)
@@ -1007,17 +810,21 @@ def main():
         except Exception:
             pass
 
-    protein_tokenizer = ProteinSequenceTokenizer()
-    smiles_tokenizer = RegexSmilesTokenizer.from_smiles(unique_smiles.keys())
-    protein_tokenizer.save(protein_vocab_path(args.cache_dir))
-    smiles_tokenizer.save(smiles_vocab_path(args.cache_dir))
+    protein_tokenizer = load_protein_tokenizer(args.prot_t5_model)
+    smiles_tokenizer = load_smiles_tokenizer()
 
     legacy = {}
     if args.legacy_feature_dir:
         legacy = load_legacy_feature_pickles(Path(args.legacy_feature_dir), set(args.feature_list) | {"graph"})
 
     protein_written, protein_dims = _save_protein_payloads(unique_sequences, args.cache_dir, protein_tokenizer, args, legacy)
-    ligand_written, ligand_dims = _save_ligand_payloads(unique_smiles, args.cache_dir, smiles_tokenizer, args, legacy)
+    # The original positional encoding depends on the molecule's column in its chunk of 100. The column comes from
+    # the row order of the full task table, as in the original Dataset.csv.
+    trfm_columns = trfm_column_map(args.base_dir / f"{args.task}_kinetic_params_1d.parquet")
+    trfm_fp = trfm_fingerprint(trfm_columns)
+    missing_columns = sum(smiles not in trfm_columns for smiles in unique_smiles)
+    _log(f"TRFM columns: {len(trfm_columns)} SMILES in the full table | fingerprint {trfm_fp} | {missing_columns} split SMILES missing (column 0)", True)
+    ligand_written, ligand_dims = _save_ligand_payloads(unique_smiles, args.cache_dir, smiles_tokenizer, args, legacy, trfm_columns, trfm_fp)
     structure_written, structure_dims, structure_skipped = _save_structure_payloads(unique_structures, args.cache_dir, args, legacy)
 
     feature_dims = {}
@@ -1026,17 +833,16 @@ def main():
     feature_dims.update(structure_dims)
 
     manifest = {
-        "cache_version": 1,
+        "cache_version": CACHE_VERSION,
+        "trfm_fingerprint": trfm_fp,
         "base_dir": str(args.base_dir),
         "cache_dir": str(args.cache_dir),
         "feature_list": args.feature_list,
         "resolved_columns": column_names,
-        "protein_max_len": int(args.protein_max_len),
-        "smiles_max_len": int(args.smiles_max_len),
-        "protein_vocab_size": len(protein_tokenizer),
-        "smiles_vocab_size": len(smiles_tokenizer),
-        "protein_pad_id": protein_tokenizer.pad_id,
-        "smiles_pad_id": smiles_tokenizer.pad_id,
+        "protein_vocab_size": protein_tokenizer.vocab_size,
+        "smiles_vocab_size": smiles_tokenizer.vocab_size,
+        "protein_pad_id": protein_tokenizer.pad_token_id,
+        "smiles_pad_id": smiles_tokenizer.pad_token_id,
         "feature_dims": feature_dims,
         "counts": {
             "split_jobs": len(jobs),
@@ -1049,7 +855,7 @@ def main():
             "structures_skipped": structure_skipped,
         },
         "legacy_feature_dir": str(args.legacy_feature_dir) if args.legacy_feature_dir else None,
-        "prot_t5_model": args.prot_t5_model if "t5" in args.feature_list else None,
+        "prot_t5_model": args.prot_t5_model,
         "trfm_weights_path": str(args.trfm_weights_path) if args.trfm_weights_path else None,
         "trfm_vocab_path": str(args.trfm_vocab_path) if args.trfm_vocab_path else None,
         "elapsed_seconds": time.time() - started,

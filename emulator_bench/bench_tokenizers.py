@@ -1,86 +1,48 @@
-import json
-import regex as re
+import re
+import sys
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import List
+
+import torch
+from transformers import T5Tokenizer
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+ORIGINAL_CODE_DIR = REPO_ROOT / "DEKP"
+if str(ORIGINAL_CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(ORIGINAL_CODE_DIR))
+
+from tokenizer import MolTranBertTokenizer  # noqa: E402
+
+# MoLFormer vocabulary (IBM/molformer, training/bert_vocab.txt), as used by the original DEKP code.
+SMILES_VOCAB_PATH = Path(__file__).with_name("bert_vocab.txt")
 
 
-SMILES_PATTERN = r"(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
+def load_protein_tokenizer(model_name_or_path: str) -> T5Tokenizer:
+    return T5Tokenizer.from_pretrained(model_name_or_path, do_lower_case=False)
 
 
-class ProteinSequenceTokenizer:
-    def __init__(self) -> None:
-        tokens = ["<pad>", "<unk>", "<bos>", "<eos>"] + list("ACDEFGHIKLMNPQRSTVWYX")
-        self.stoi: Dict[str, int] = {token: idx for idx, token in enumerate(tokens)}
-        self.itos: List[str] = list(tokens)
-        self.pad_id = self.stoi["<pad>"]
-        self.unk_id = self.stoi["<unk>"]
-        self.bos_id = self.stoi["<bos>"]
-        self.eos_id = self.stoi["<eos>"]
-
-    def __len__(self) -> int:
-        return len(self.itos)
-
-    def encode(self, sequence: str, max_length: int | None = None, add_special_tokens: bool = True) -> List[int]:
-        tokens = [self.stoi.get(char, self.unk_id) for char in str(sequence)]
-        if add_special_tokens:
-            tokens = [self.bos_id] + tokens + [self.eos_id]
-        if max_length is not None:
-            tokens = tokens[:max_length]
-        return tokens
-
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump({"itos": self.itos}, handle, indent=2)
+def load_smiles_tokenizer() -> MolTranBertTokenizer:
+    return MolTranBertTokenizer(str(SMILES_VOCAB_PATH))
 
 
-class RegexSmilesTokenizer:
-    def __init__(self, stoi: Dict[str, int], itos: List[str]) -> None:
-        self.regex_tokenizer = re.compile(SMILES_PATTERN)
-        self.stoi = stoi
-        self.itos = itos
-        self.pad_id = stoi["<pad>"]
-        self.unk_id = stoi["<unk>"]
-        self.bos_id = stoi["<bos>"]
-        self.eos_id = stoi["<eos>"]
+def protein_token_ids(tokenizer: T5Tokenizer, sequence: str) -> List[int]:
+    """Unpadded ids exactly as in DEKP KcatDataset: rare residues map to X, residues are space-joined."""
+    residues = re.sub(r"[UZOB*]", "X", str(sequence).rstrip("*"))
+    return tokenizer.encode(" ".join(residues), add_special_tokens=True)
 
-    def __len__(self) -> int:
-        return len(self.itos)
 
-    def tokenize(self, smiles: str) -> List[str]:
-        return self.regex_tokenizer.findall(str(smiles).strip())
+def smiles_token_ids(tokenizer: MolTranBertTokenizer, smiles: str) -> List[int]:
+    """Unpadded ids exactly as in DEKP KcatDataset: characters are space-joined before the regex split.
 
-    def encode(self, smiles: str, max_length: int | None = None, add_special_tokens: bool = True) -> List[int]:
-        ids = [self.stoi.get(token, self.unk_id) for token in self.tokenize(smiles)]
-        if add_special_tokens:
-            ids = [self.bos_id] + ids + [self.eos_id]
-        if max_length is not None:
-            ids = ids[:max_length]
-        return ids
+    The regex split is called directly so the ids do not depend on the lower-casing of newer transformers versions.
+    """
+    tokens = tokenizer._tokenize(" ".join(str(smiles)))
+    return [tokenizer.cls_token_id, *tokenizer.convert_tokens_to_ids(tokens), tokenizer.sep_token_id]
 
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump({"itos": self.itos}, handle, indent=2)
 
-    @classmethod
-    def from_smiles(cls, smiles_values: Iterable[str], min_freq: int = 1) -> "RegexSmilesTokenizer":
-        regex_tokenizer = re.compile(SMILES_PATTERN)
-        counts: Dict[str, int] = {}
-        for smiles in smiles_values:
-            for token in regex_tokenizer.findall(str(smiles).strip()):
-                counts[token] = counts.get(token, 0) + 1
-        itos = ["<pad>", "<unk>", "<bos>", "<eos>"] + sorted(
-            [token for token, count in counts.items() if count >= min_freq]
-        )
-        stoi = {token: idx for idx, token in enumerate(itos)}
-        return cls(stoi=stoi, itos=itos)
-
-    @classmethod
-    def load(cls, path: Path) -> "RegexSmilesTokenizer":
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        itos = list(payload["itos"])
-        stoi = {token: idx for idx, token in enumerate(itos)}
-        return cls(stoi=stoi, itos=itos)
-
+def pad_tokens(token_ids: torch.Tensor, max_length: int, pad_id: int) -> torch.Tensor:
+    """Pad to max_length, or truncate keeping the final special token (as tokenizer truncation does)."""
+    if token_ids.numel() > max_length:
+        return torch.cat([token_ids[: max_length - 1], token_ids[-1:]]).long()
+    padding = torch.full((max_length - token_ids.numel(),), int(pad_id), dtype=torch.long)
+    return torch.cat([token_ids.long(), padding])
