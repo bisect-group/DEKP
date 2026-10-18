@@ -1,24 +1,33 @@
-# Run from baselines/DEKP. Tasks: km (paper) and kcat. Data: data/processed/datasets/kinetic_dataset/<task>.
-# Outputs: outputs/baselines/DEKP/<task>/{manifests,embeddings,runs}. Use CUDA_VISIBLE_DEVICES to pick a GPU.
+# Run from the DEKP submodule root (EMULaToR/baselines/DEKP).
+PY=/home/adhil/.conda/envs/mldb/bin/python
+OUT=../../outputs/baselines/DEKP
+
+# Tasks: km (paper) and kcat. Data: data/processed/datasets/kinetic_dataset/<task>.
+# Outputs: $OUT/<task>/{manifests,embeddings,<split_group>/<split_name>/seed_<s>}. Use CUDA_VISIBLE_DEVICES to pick a GPU.
 # Split folders are discovered from disk (random grouped x2, uniprot time, enzyme_sequence threshold_*, substrate threshold_*).
 
 # 1. Resolve one structure per row (writes manifests, never edits the split files).
 for task in km kcat; do
-  python emulator_bench/prepare_splits.py --task $task
+  $PY emulator_bench/prepare_splits.py --task $task
 done
 
 # 2. Build the caches, then train 3 seeds on every split (original settings: 200 epochs, batch 256, lr 1e-3).
 for task in km kcat; do
-  python emulator_bench/run_split_benchmarks.py --task $task --seeds 666 777 888 --device cuda:0
+  $PY emulator_bench/run_split_benchmarks.py --task $task --seeds 666 777 888 --device cuda:0
 done
 
-# Summaries: outputs/baselines/DEKP/<task>/runs/dekp_summary_{runs,thresholds,by_split_group,ranked}.csv
+# Same on GPUs 0 1 with two runs per GPU and mixed precision for the network (Extra Trees stays on CPU).
+for task in km kcat; do
+  $PY emulator_bench/run_split_benchmarks.py --task $task --seeds 666 777 888 --gpus 0 1 --runs_per_gpu 2 --amp
+done
+
+# Summaries: $OUT/<task>/dekp_summary_{runs,thresholds,by_split_group,ranked}.csv
 
 # One split, one seed (cache must exist).
-python emulator_bench/train_single_target_tvt.py \
-  --train_path outputs/baselines/DEKP/km/manifests/random_splits_grouped_sequence/flat/train.parquet \
-  --val_path outputs/baselines/DEKP/km/manifests/random_splits_grouped_sequence/flat/val.parquet \
-  --test_path outputs/baselines/DEKP/km/manifests/random_splits_grouped_sequence/flat/test.parquet \
-  --cache_dir outputs/baselines/DEKP/km/embeddings \
-  --out_dir outputs/baselines/DEKP/km/runs/random_splits_grouped_sequence/flat/seed_666 \
+$PY emulator_bench/train_single_target_tvt.py \
+  --train_path $OUT/km/manifests/random_splits_grouped_sequence/all/train.parquet \
+  --val_path $OUT/km/manifests/random_splits_grouped_sequence/all/val.parquet \
+  --test_path $OUT/km/manifests/random_splits_grouped_sequence/all/test.parquet \
+  --cache_dir $OUT/km/embeddings \
+  --out_dir $OUT/km/random_splits_grouped_sequence/all/seed_666 \
   --seed 666

@@ -49,7 +49,7 @@ def task_paths(task: str, out_root: Path = OUT_ROOT) -> Dict[str, Path]:
         "base_dir": DATA_ROOT / task,
         "cache_dir": Path(out_root) / task / "embeddings",
         "manifests_dir": Path(out_root) / task / "manifests",
-        "out_dir": Path(out_root) / task / "runs",
+        "out_dir": Path(out_root) / task,
     }
 
 
@@ -162,6 +162,15 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def resolve_amp_dtype(device: torch.device):
+    """bf16 on Ampere or newer, fp16 on older GPUs, fp32 (None) on CPU."""
+    if device.type != "cuda":
+        return None, "fp32"
+    if torch.cuda.get_device_capability(device)[0] >= 8:
+        return torch.bfloat16, "bf16"
+    return torch.float16, "fp16"
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -328,11 +337,11 @@ def discover_split_jobs(
         flat_job = _build_split_job(
             group_dir,
             split_group=split_group,
-            split_name="flat",
+            split_name="all",
             difficulty="flat",
         )
         if flat_job is not None and (
-            threshold_filter is None or any(name in threshold_filter for name in {"flat", "default", split_group})
+            threshold_filter is None or any(name in threshold_filter for name in {"all", "default", split_group})
         ):
             jobs.append(flat_job)
 
@@ -376,7 +385,7 @@ def resolve_single_split_job(base_dir: Path, split_group: str, threshold: Option
         job
         for job in jobs
         if job["split_name"] == threshold
-        or (job["split_name"] == "flat" and threshold in {"flat", "default", split_group})
+        or (job["split_name"] == "all" and threshold in {"all", "default", split_group})
     ]
     if not matching:
         available = ", ".join(job["split_name"] for job in jobs)

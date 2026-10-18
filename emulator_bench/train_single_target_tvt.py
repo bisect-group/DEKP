@@ -37,6 +37,7 @@ from emulator_bench.common import (
     protein_cache_path,
     read_table,
     regression_metrics,
+    resolve_amp_dtype,
     save_json,
     set_seed,
     structure_cache_path,
@@ -267,6 +268,7 @@ def main():
     parser.add_argument("--kernel_size", type=int, default=9)
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--amp", action="store_true", help="Mixed precision for the network training (bf16 on Ampere or newer, else fp16). The original trains in fp32. Extra Trees is unaffected.")
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--persistent_workers", action="store_true")
@@ -338,6 +340,8 @@ def main():
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+    amp_dtype = resolve_amp_dtype(device)[0] if args.amp else None
+    scaler = torch.amp.GradScaler("cuda") if amp_dtype == torch.float16 else None
 
     protein_store = ProteinEmbeddingStore(
         cache_dir=cache_dir,
@@ -423,10 +427,16 @@ def main():
                     graph_batch, protein_tokens, smiles_tokens, features, labels, device
                 )
                 optimizer.zero_grad(set_to_none=True)
-                outputs = model(graph_batch, protein_tokens, smiles_tokens, features)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                    outputs = model(graph_batch, protein_tokens, smiles_tokens, features)
+                loss = criterion(outputs.float(), labels)
+                if scaler is None:
+                    loss.backward()
+                    optimizer.step()
+                else:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
                 batch_size = int(labels.numel())
                 train_loss_sum += float(loss.item()) * batch_size
                 train_examples += batch_size

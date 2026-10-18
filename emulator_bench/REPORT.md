@@ -45,7 +45,7 @@ For `--task km|kcat` it runs three steps on every discovered split folder and se
 4. `run_split_benchmarks.py` loops over split folders and seeds and writes the summary CSVs (mean and variance over seeds).
 
 Split folders (from disk, task `km`): `random_splits_grouped_sequence`, `random_splits_grouped_smiles`, `uniprot_time_splits`, `enzyme_sequence_splits/threshold_0.05`, `substrate_splits/threshold_0.445`. kcat uses `threshold_0.01` and `threshold_0.205`.
-Outputs go to `EMULaToR/outputs/baselines/DEKP/<task>/{manifests,embeddings,runs}` (git-ignored). Nothing is written under `data/`.
+Outputs go to `EMULaToR/outputs/baselines/DEKP/<task>/{manifests,embeddings,<split_group>/<split_name>/seed_<s>}` (git-ignored). Nothing is written under `data/`.
 
 ## Files removed or changed
 
@@ -72,7 +72,7 @@ Changed:
 
 ## Deviations from the original protocol
 
-- None for precision. Training, inference and caches are fp32 (original behaviour). Autocast, TF32 and GradScaler are removed. The paper appendix bf16 claim does not override the original code.
+- None for precision by default. Training, inference and caches are fp32 (original behaviour). `--amp` is an opt-in autocast of the network training forward pass (bf16, or fp16 with GradScaler on older GPUs). TF32 stays off. The paper appendix bf16 claim does not override the original code.
 - `--cache_dtype` defaults to float32. Caches built earlier with float16 must be rebuilt (`--overwrite_cache`).
 - `ExtraTreesRegressor(n_jobs=-1, random_state=seed)`. The original is unseeded. Seeding makes runs reproducible.
 - Original preprocessing (`pretrain.py:531-534`: `Label != 1e-8`, no `.` in SMILES) is applied to the TRAIN split only, using `value` for the label filter. The training target is `log10_value`. Val and test rows are not filtered, so every baseline keeps the same test rows (except rows without a structure).

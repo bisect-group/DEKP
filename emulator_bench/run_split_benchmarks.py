@@ -1,6 +1,9 @@
 import argparse
+import os
+import queue
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -73,12 +76,18 @@ def maybe_cache_embeddings(args):
     subprocess.run(cmd, check=True, cwd=str(REPO_ROOT))
 
 
-def _run_training(job, seed, args):
-    result_root = Path(args.out_dir) / job["split_group"] / job["split_name"] / f"seed_{seed}"
+def _result_root(job, seed, args):
+    return Path(args.out_dir) / job["split_group"] / job["split_name"] / f"seed_{seed}"
+
+
+def _run_training(job, seed, args, gpu):
+    result_root = _result_root(job, seed, args)
     result_root.mkdir(parents=True, exist_ok=True)
-    final_test_path = result_root / "final_results_test.csv"
-    if final_test_path.exists() and not args.overwrite_runs:
-        return result_root
+    if (result_root / "final_results_test.csv").exists() and not args.overwrite_runs:
+        return
+    env = os.environ.copy()
+    if gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = gpu
 
     cmd = [
         sys.executable,
@@ -114,7 +123,7 @@ def _run_training(job, seed, args):
         "--dropout",
         str(args.dropout),
         "--device",
-        args.device,
+        "cuda:0" if gpu is not None else args.device,
         "--num_workers",
         str(args.num_workers),
         "--prefetch_factor",
@@ -140,8 +149,28 @@ def _run_training(job, seed, args):
         cmd.append("--preload_structures")
     if args.compile_model:
         cmd.append("--compile_model")
-    subprocess.run(cmd, check=True, cwd=str(REPO_ROOT))
-    return result_root
+    if args.amp:
+        cmd.append("--amp")
+    subprocess.run(cmd, check=True, cwd=str(REPO_ROOT), env=env)
+
+
+def run_all_training(jobs, args):
+    slots = queue.Queue()
+    for _ in range(args.runs_per_gpu):
+        for gpu in args.gpus or [None]:
+            slots.put(None if gpu is None else str(gpu))
+
+    def work(task):
+        gpu = slots.get()
+        try:
+            _run_training(*task, args, gpu)
+        finally:
+            slots.put(gpu)
+
+    tasks = [(job, seed) for job in jobs for seed in args.seeds]
+    with ThreadPoolExecutor(slots.qsize()) as pool:
+        for _ in progress(pool.map(work, tasks), total=len(tasks), desc="Training runs", unit="run"):
+            pass
 
 
 def main():
@@ -161,7 +190,10 @@ def main():
     parser.add_argument("--structure_id_col", type=str, default=None)
     parser.add_argument("--target_col", type=str, default=None)
     parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Training device when --gpus is not set.")
+    parser.add_argument("--gpus", nargs="+", default=None, help="GPU ids, e.g. --gpus 0 1 2. Each training run gets one GPU through CUDA_VISIBLE_DEVICES. Extra Trees runs on CPU.")
+    parser.add_argument("--runs_per_gpu", type=int, default=1, help="Concurrent training runs per GPU.")
+    parser.add_argument("--amp", action="store_true", help="Mixed precision for the network training (bf16 on Ampere or newer, else fp16). The original trains in fp32. Extra Trees is unaffected.")
     parser.add_argument("--cache_device", type=str, default="cuda:0")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=200)
@@ -204,10 +236,11 @@ def main():
     jobs = apply_manifest_paths_to_jobs(jobs, Path(args.manifests_dir).expanduser(), require=True)
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    run_all_training(jobs, args)
     run_rows = []
-    for job in progress(jobs, desc="Split jobs", unit="job"):
+    for job in jobs:
         for seed in args.seeds:
-            result_root = _run_training(job, seed, args)
+            result_root = _result_root(job, seed, args)
             metrics = pd.read_csv(result_root / "final_results_test.csv").iloc[0].to_dict()
             used = pd.read_csv(result_root / "run_summary.csv").iloc[0]
             sizes = split_sizes(Path(job["train_path"]), Path(job["val_path"]), Path(job["test_path"]))
