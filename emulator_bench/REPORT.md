@@ -76,7 +76,7 @@ Changed:
 - `--cache_dtype` defaults to float32. Caches built earlier with float16 must be rebuilt (`--overwrite_cache`).
 - `ExtraTreesRegressor(n_jobs=-1, random_state=seed)`. The original is unseeded. Seeding makes runs reproducible.
 - Original preprocessing (`pretrain.py:531-534`: `Label != 1e-8`, no `.` in SMILES) is applied to the TRAIN split only, using `value` for the label filter. The training target is `log10_value`. Val and test rows are not filtered, so every baseline keeps the same test rows (except rows without a structure).
-- Structure graphs, token ids and embeddings are cached and read through DataLoader workers.
+- Structure graphs, token ids and embeddings are cached and read through DataLoader workers. Workers memory-map the cache files and read no row twice. A thread pins the next batch and copies it on a side stream while the current batch trains. Workers persist across epochs. One extra RNG draw before each re-iteration keeps the shuffle order and the global RNG state equal to non-persistent workers. A toy-loader check runs at start-up.
 - Per-sample structure is chosen by `prepare_splits.py` (no original equivalent; the original used one fixed structure per UniProt ID).
 
 ## Commands

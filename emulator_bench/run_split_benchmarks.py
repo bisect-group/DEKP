@@ -128,8 +128,6 @@ def _run_training(job, seed, args, gpu):
         str(args.num_workers),
         "--prefetch_factor",
         str(args.prefetch_factor),
-        "--cache_items",
-        str(args.cache_items),
         "--seed",
         str(seed),
     ]
@@ -137,16 +135,9 @@ def _run_training(job, seed, args, gpu):
         value = getattr(args, key)
         if value:
             cmd.extend([f"--{key}", value])
-    if args.persistent_workers:
-        cmd.append("--persistent_workers")
+    cmd.append("--persistent_workers" if args.persistent_workers else "--no-persistent_workers")
     if args.pin_memory:
         cmd.append("--pin_memory")
-    if args.preload_proteins:
-        cmd.append("--preload_proteins")
-    if args.preload_ligands:
-        cmd.append("--preload_ligands")
-    if args.preload_structures:
-        cmd.append("--preload_structures")
     if args.compile_model:
         cmd.append("--compile_model")
     if args.amp:
@@ -205,12 +196,8 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch_factor", type=int, default=4)
-    parser.add_argument("--persistent_workers", action="store_true")
+    parser.add_argument("--persistent_workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pin_memory", action="store_true")
-    parser.add_argument("--preload_proteins", action="store_true")
-    parser.add_argument("--preload_ligands", action="store_true")
-    parser.add_argument("--preload_structures", action="store_true")
-    parser.add_argument("--cache_items", type=int, default=512)
     parser.add_argument("--compile_model", action="store_true")
     parser.add_argument("--skip_cache", action="store_true")
     parser.add_argument("--overwrite_cache", action="store_true")

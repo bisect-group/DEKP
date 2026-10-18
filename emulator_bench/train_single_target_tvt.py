@@ -1,7 +1,9 @@
 import argparse
 import gc
 import json
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -48,10 +50,8 @@ from emulator_bench.modeling import MetaDecoder, graph_collate_fn
 
 
 def _worker_init_fn(worker_id: int) -> None:
-    # Each structure cache file is ~4 MB. With the default LRU (cache_items) and
-    # prefetch_factor the DataLoader can hold many GB of graph tensors simultaneously.
-    # Run Python's cyclic GC more aggressively in workers so that any Python-level
-    # cycles (e.g. from future torch_geometric upgrades) don't accumulate.
+    # Each structure cache file is ~4 MB and prefetch_factor batches are in flight per worker.
+    # Run Python's cyclic GC more aggressively in workers so that Python-level cycles don't accumulate.
     import gc as _gc
     _gc.set_threshold(100, 5, 2)
 
@@ -90,12 +90,85 @@ def _make_loader(dataset, batch_size, shuffle, args):
 
 
 def _move_batch(graph_batch, protein_tokens, smiles_tokens, features, labels, device):
-    graph_batch = graph_batch.to(device)
+    graph_batch = graph_batch.to(device, non_blocking=True)
     protein_tokens = protein_tokens.to(device, non_blocking=True)
     smiles_tokens = smiles_tokens.to(device, non_blocking=True)
     features = features.to(device, non_blocking=True)
     labels = labels.to(device, non_blocking=True)
     return graph_batch, protein_tokens, smiles_tokens, features, labels
+
+
+def _sync_rng(loader) -> None:
+    """Keep the global RNG sequence of a persistent loader equal to a non-persistent one.
+
+    A persistent loader draws its worker base seed once. A non-persistent loader draws it at every
+    iteration. One matching draw before each re-iteration keeps the global RNG and the shuffle order the same.
+    """
+    if loader.num_workers > 0 and loader.persistent_workers:
+        if getattr(loader, "_iterated", False):
+            torch.empty((), dtype=torch.int64).random_()
+        loader._iterated = True
+
+
+def _check_persistent_order() -> None:
+    """Assert on a toy loader that persistent workers with `_sync_rng` match non-persistent shuffle order and RNG state."""
+    state = torch.get_rng_state()
+    results = []
+    for persistent in (False, True):
+        torch.manual_seed(0)
+        loader = DataLoader(list(range(20)), batch_size=5, shuffle=True, num_workers=2, persistent_workers=persistent)
+        orders = []
+        for _ in range(3):
+            _sync_rng(loader)
+            orders.append([batch.tolist() for batch in loader])
+        results.append((orders, torch.get_rng_state()))
+    torch.set_rng_state(state)
+    assert results[0][0] == results[1][0] and torch.equal(results[0][1], results[1][1]), (
+        "Persistent workers change the shuffle order or the global RNG state in this PyTorch version."
+    )
+
+
+def _prefetch(loader, device):
+    """Yield (graph, protein_tokens, smiles_tokens, features, labels, metadata) with tensors on `device`.
+
+    On CUDA a thread copies the next batch on a side stream while the consumer works on the current one.
+    At most two batches are on the GPU at once.
+    """
+    _sync_rng(loader)
+    if device.type != "cuda":
+        for *tensors, metadata in loader:
+            yield (*_move_batch(*tensors, device), metadata)
+        return
+
+    stream = torch.cuda.Stream(device)
+    free_slot = threading.Semaphore(1)
+    ready = queue.Queue()
+
+    def produce():
+        try:
+            for *tensors, metadata in loader:
+                free_slot.acquire()
+                with torch.cuda.stream(stream):
+                    moved = _move_batch(*(tensor.pin_memory() for tensor in tensors), device)
+                    copied = torch.cuda.Event()
+                    copied.record(stream)
+                ready.put((moved, metadata, copied))
+            ready.put(None)
+        except BaseException as exc:
+            ready.put(exc)
+
+    threading.Thread(target=produce, daemon=True).start()
+    current = torch.cuda.current_stream(device)
+    while (item := ready.get()) is not None:
+        if isinstance(item, BaseException):
+            raise item
+        moved, metadata, copied = item
+        free_slot.release()
+        current.wait_event(copied)
+        moved[0].apply(lambda tensor: tensor.record_stream(current) or tensor)
+        for tensor in moved[1:]:
+            tensor.record_stream(current)
+        yield (*moved, metadata)
 
 
 def evaluate(model, loader, device):
@@ -106,10 +179,7 @@ def evaluate(model, loader, device):
     preds, labels, metadata_rows = [], [], []
 
     with torch.no_grad():
-        for graph_batch, protein_tokens, smiles_tokens, features, label_tensor, metadata in loader:
-            graph_batch, protein_tokens, smiles_tokens, features, label_tensor = _move_batch(
-                graph_batch, protein_tokens, smiles_tokens, features, label_tensor, device
-            )
+        for graph_batch, protein_tokens, smiles_tokens, features, label_tensor, metadata in _prefetch(loader, device):
             outputs = model(graph_batch, protein_tokens, smiles_tokens, features)
             loss = mse_loss(outputs, label_tensor)
 
@@ -129,10 +199,7 @@ def extract_latents(model, loader, device):
     model.eval()
     latents, labels, metadata_rows = [], [], []
     with torch.no_grad():
-        for graph_batch, protein_tokens, smiles_tokens, features, label_tensor, metadata in loader:
-            graph_batch, protein_tokens, smiles_tokens, features, label_tensor = _move_batch(
-                graph_batch, protein_tokens, smiles_tokens, features, label_tensor, device
-            )
+        for graph_batch, protein_tokens, smiles_tokens, features, label_tensor, metadata in _prefetch(loader, device):
             model(graph_batch, protein_tokens, smiles_tokens, features)
             latents.append(model.encode().detach().float().cpu())
             labels.extend(label_tensor.detach().float().cpu().tolist())
@@ -271,16 +338,14 @@ def main():
     parser.add_argument("--amp", action="store_true", help="Mixed precision for the network training (bf16 on Ampere or newer, else fp16). The original trains in fp32. Extra Trees is unaffected.")
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch_factor", type=int, default=2)
-    parser.add_argument("--persistent_workers", action="store_true")
+    parser.add_argument("--persistent_workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pin_memory", action="store_true")
-    parser.add_argument("--preload_proteins", action="store_true")
-    parser.add_argument("--preload_ligands", action="store_true")
-    parser.add_argument("--preload_structures", action="store_true")
-    parser.add_argument("--cache_items", type=int, default=64)
     parser.add_argument("--seed", type=int, default=SEEDS[0])
     parser.add_argument("--compile_model", action="store_true")
     args = parser.parse_args()
 
+    if args.num_workers > 0 and args.persistent_workers:
+        _check_persistent_order()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = Path(args.cache_dir)
@@ -343,33 +408,9 @@ def main():
     amp_dtype = resolve_amp_dtype(device)[0] if args.amp else None
     scaler = torch.amp.GradScaler("cuda") if amp_dtype == torch.float16 else None
 
-    protein_store = ProteinEmbeddingStore(
-        cache_dir=cache_dir,
-        sequences=train_df[resolved_columns["sequence_col"]].tolist() if args.preload_proteins else None,
-        preload=args.preload_proteins,
-        max_items=args.cache_items,
-    )
-    ligand_store = LigandEmbeddingStore(
-        cache_dir=cache_dir,
-        fingerprint=manifest["trfm_fingerprint"],
-        smiles_values=train_df[resolved_columns["smiles_col"]].tolist() if args.preload_ligands else None,
-        preload=args.preload_ligands,
-        max_items=args.cache_items,
-    )
-    structure_items = None
-    if args.preload_structures:
-        structure_items = list(
-            zip(
-                train_df[resolved_columns["structure_id_col"]].astype(str).tolist(),
-                train_df[resolved_columns["sequence_col"]].astype(str).tolist(),
-            )
-        )
-    structure_store = StructureEmbeddingStore(
-        cache_dir=cache_dir,
-        items=structure_items,
-        preload=args.preload_structures,
-        max_items=args.cache_items,
-    )
+    protein_store = ProteinEmbeddingStore(cache_dir)
+    ligand_store = LigandEmbeddingStore(cache_dir, manifest["trfm_fingerprint"])
+    structure_store = StructureEmbeddingStore(cache_dir)
 
     dataset_kwargs = {
         "protein_store": protein_store,
@@ -421,11 +462,8 @@ def main():
             train_loss_sum = 0.0
             train_examples = 0
             batch_count = 0
-            iterator = progress(train_loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch", leave=False)
+            iterator = progress(_prefetch(train_loader, device), total=len(train_loader), desc=f"Epoch {epoch}/{args.epochs}", unit="batch", leave=False)
             for graph_batch, protein_tokens, smiles_tokens, features, labels, _ in iterator:
-                graph_batch, protein_tokens, smiles_tokens, features, labels = _move_batch(
-                    graph_batch, protein_tokens, smiles_tokens, features, labels, device
-                )
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                     outputs = model(graph_batch, protein_tokens, smiles_tokens, features)

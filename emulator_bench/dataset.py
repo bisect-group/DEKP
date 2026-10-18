@@ -1,8 +1,6 @@
-from collections import OrderedDict
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
-import math
 import pandas as pd
 import torch
 
@@ -14,84 +12,41 @@ from emulator_bench.common import (
     structure_cache_path,
 )
 
+OPTIONAL_METADATA_KEYS = ["ECNumber", "ec_number", "Type", "type", "uniprot_id", "UniprotID"]
+
 
 def _load_pt(path: Path):
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     except Exception as exc:
         raise RuntimeError(
             f"Failed to load cached payload {path}. Rebuild this cache entry or rerun cache_embeddings.py --overwrite."
         ) from exc
 
 
-class _LRUStore:
-    def __init__(self, max_items: int = 256):
-        self.max_items = max(1, int(max_items))
-        self._cache: "OrderedDict[str, object]" = OrderedDict()
-
-    def _get_or_load(self, key: str, path: Path):
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
-        payload = _load_pt(path)
-        self._cache[key] = payload
-        if len(self._cache) > self.max_items:
-            self._cache.popitem(last=False)
-        return payload
-
-
-class ProteinEmbeddingStore(_LRUStore):
-    def __init__(self, cache_dir: Path, sequences: Optional[Iterable[str]] = None, preload: bool = False, max_items: int = 256):
-        super().__init__(max_items=max_items)
+class ProteinEmbeddingStore:
+    def __init__(self, cache_dir: Path):
         self.cache_dir = Path(cache_dir)
-        if preload and sequences is not None:
-            for sequence in sorted({normalize_sequence(sequence) for sequence in sequences}):
-                self.get(sequence)
 
     def get(self, sequence: str):
-        normalized = normalize_sequence(sequence)
-        path = protein_cache_path(self.cache_dir, normalized)
-        if not path.exists():
-            raise FileNotFoundError(f"Missing cached protein payload: {path}")
-        return self._get_or_load(normalized, path)
+        return _load_pt(protein_cache_path(self.cache_dir, normalize_sequence(sequence)))
 
 
-class LigandEmbeddingStore(_LRUStore):
-    def __init__(self, cache_dir: Path, fingerprint: str, smiles_values: Optional[Iterable[str]] = None, preload: bool = False, max_items: int = 256):
-        super().__init__(max_items=max_items)
+class LigandEmbeddingStore:
+    def __init__(self, cache_dir: Path, fingerprint: str):
         self.cache_dir = Path(cache_dir)
         self.fingerprint = fingerprint
-        if preload and smiles_values is not None:
-            for smiles in sorted({str(smiles) for smiles in smiles_values}):
-                self.get(smiles)
 
     def get(self, smiles: str):
-        smiles = str(smiles).strip()
-        path = ligand_cache_path(self.cache_dir, smiles, self.fingerprint)
-        if not path.exists():
-            raise FileNotFoundError(f"Missing cached ligand payload: {path}")
-        return self._get_or_load(smiles, path)
+        return _load_pt(ligand_cache_path(self.cache_dir, str(smiles).strip(), self.fingerprint))
 
 
-class StructureEmbeddingStore(_LRUStore):
-    def __init__(self, cache_dir: Path, items: Optional[Iterable[tuple[str, str]]] = None, preload: bool = False, max_items: int = 256):
-        super().__init__(max_items=max_items)
+class StructureEmbeddingStore:
+    def __init__(self, cache_dir: Path):
         self.cache_dir = Path(cache_dir)
-        if preload and items is not None:
-            seen = set()
-            for structure_id, sequence in items:
-                key = f"{structure_id}::{normalize_sequence(sequence)}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                self.get(structure_id, sequence)
 
     def get(self, structure_id: str, sequence: str):
-        path = structure_cache_path(self.cache_dir, structure_id=structure_id, fallback_sequence=sequence)
-        if not path.exists():
-            raise FileNotFoundError(f"Missing cached structure payload: {path}")
-        cache_key = f"{structure_id}::{normalize_sequence(sequence)}"
-        return self._get_or_load(cache_key, path)
+        return _load_pt(structure_cache_path(self.cache_dir, structure_id=structure_id, fallback_sequence=sequence))
 
 
 class CachedDEKPDataset(torch.utils.data.Dataset):
@@ -128,19 +83,25 @@ class CachedDEKPDataset(torch.utils.data.Dataset):
         self.protein_pad_id = int(protein_pad_id)
         self.smiles_pad_id = int(smiles_pad_id)
 
+        frame = self.frame
+        self._sequences = [str(value) for value in frame[sequence_col]]
+        self._smiles = [str(value) for value in frame[smiles_col]]
+        self._protein_ids = [str(value) for value in frame[protein_id_col]]
+        self._structure_ids = [
+            protein_id if pd.isna(raw) or str(raw).strip().lower() in ("", "nan", "none") else str(raw).strip()
+            for protein_id, raw in zip(self._protein_ids, frame[self.structure_id_col])
+        ]
+        self._targets = frame[target_col].astype(float).tolist() if target_col else None
+        self._optional = {key: frame[key].tolist() for key in OPTIONAL_METADATA_KEYS if key in frame.columns}
+
     def __len__(self) -> int:
         return len(self.frame)
 
     def __getitem__(self, idx: int):
-        row = self.frame.iloc[idx]
-        sequence = str(row[self.sequence_col])
-        smiles = str(row[self.smiles_col])
-        protein_id = str(row[self.protein_id_col])
-        raw_struct = row[self.structure_id_col] if self.structure_id_col in row.index else None
-        if raw_struct is None or (isinstance(raw_struct, float) and math.isnan(raw_struct)) or str(raw_struct).strip().lower() in ("", "nan", "none"):
-            structure_id = protein_id
-        else:
-            structure_id = str(raw_struct).strip()
+        sequence = self._sequences[idx]
+        smiles = self._smiles[idx]
+        protein_id = self._protein_ids[idx]
+        structure_id = self._structure_ids[idx]
 
         protein_payload = self.protein_store.get(sequence)
         ligand_payload = self.ligand_store.get(smiles)
@@ -148,22 +109,20 @@ class CachedDEKPDataset(torch.utils.data.Dataset):
 
         feature_tensors = []
         for feature_name in self.feature_names:
-            if feature_name in protein_payload:
-                feature_tensors.append(protein_payload[feature_name].float())
-            elif feature_name in ligand_payload:
-                feature_tensors.append(ligand_payload[feature_name].float())
-            elif feature_name in structure_payload:
-                feature_tensors.append(structure_payload[feature_name].float())
+            for payload in (protein_payload, ligand_payload, structure_payload):
+                if feature_name in payload:
+                    feature_tensors.append(payload[feature_name].float())
+                    break
             else:
                 raise KeyError(
                     f"Feature `{feature_name}` was requested but is missing from cached protein/ligand/structure payloads."
                 )
-        feature_tensor = torch.cat(feature_tensors, dim=-1).float()
+        feature_tensor = torch.cat(feature_tensors, dim=-1)
 
-        label_value = float(row[self.target_col]) if self.target_col and self.target_col in row.index else float("nan")
+        label_value = self._targets[idx] if self._targets is not None else float("nan")
         label_tensor = torch.tensor(label_value, dtype=torch.float32)
-        protein_tokens = pad_tokens(protein_payload["token_ids"].long(), self.protein_max_len, self.protein_pad_id)
-        smiles_tokens = pad_tokens(ligand_payload["token_ids"].long(), self.smiles_max_len, self.smiles_pad_id)
+        protein_tokens = pad_tokens(protein_payload["token_ids"], self.protein_max_len, self.protein_pad_id)
+        smiles_tokens = pad_tokens(ligand_payload["token_ids"], self.smiles_max_len, self.smiles_pad_id)
         graph = structure_payload["graph"]
 
         metadata = {
@@ -174,8 +133,7 @@ class CachedDEKPDataset(torch.utils.data.Dataset):
             "smiles": smiles,
             "target": label_value,
         }
-        for optional_key in ["ECNumber", "ec_number", "Type", "type", "uniprot_id", "UniprotID"]:
-            if optional_key in row.index:
-                metadata[optional_key] = row[optional_key]
+        for key, values in self._optional.items():
+            metadata[key] = values[idx]
 
         return graph, protein_tokens, smiles_tokens, feature_tensor, label_tensor, metadata

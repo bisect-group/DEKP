@@ -16,9 +16,9 @@ for task in km kcat; do
   $PY emulator_bench/run_split_benchmarks.py --task $task --seeds 666 777 888 --device cuda:0
 done
 
-# Same on GPUs 0 1 with two runs per GPU and mixed precision for the network (Extra Trees stays on CPU).
+# Same on GPUs 0 1 with one run per GPU and mixed precision for the network (Extra Trees stays on CPU).
 for task in km kcat; do
-  $PY emulator_bench/run_split_benchmarks.py --task $task --seeds 666 777 888 --gpus 0 1 --runs_per_gpu 2 --amp
+  $PY emulator_bench/run_split_benchmarks.py --task $task --seeds 666 777 888 --gpus 0 1 --runs_per_gpu 1 --amp
 done
 
 # Summaries: $OUT/<task>/dekp_summary_{runs,thresholds,by_split_group,ranked}.csv
