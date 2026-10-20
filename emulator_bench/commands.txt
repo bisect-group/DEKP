@@ -4,14 +4,15 @@ OUT=../../outputs/baselines/DEKP
 
 # Tasks: km (paper) and kcat. Data: data/processed/datasets/kinetic_dataset/<task>.
 # Outputs: $OUT/<task>/{manifests,embeddings,<split_group>/<split_name>/seed_<s>}. Use CUDA_VISIBLE_DEVICES to pick a GPU.
-# Split folders are discovered from disk (random grouped x2, uniprot time, enzyme_sequence threshold_*, substrate threshold_*).
+# Split folders are discovered from disk (random grouped x2, uniprot time, enzyme_sequence, enzyme_structure, substrate and conformer_cosine threshold_*).
 
 # 1. Resolve one structure per row (writes manifests, never edits the split files).
 for task in km kcat; do
   $PY emulator_bench/prepare_splits.py --task $task
 done
 
-# 2. Build the caches, then train 3 seeds on every split (original settings: 200 epochs, batch 256, lr 1e-3).
+# 2. Count missing cache items first: $PY emulator_bench/cache_embeddings.py --task kcat --dry_run
+#    Build the caches, then train 3 seeds on every split (original settings: 200 epochs, batch 256, lr 1e-3).
 for task in km kcat; do
   $PY emulator_bench/run_split_benchmarks.py --task $task --seeds 666 777 888 --device cuda:0
 done

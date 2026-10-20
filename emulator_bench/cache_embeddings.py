@@ -752,6 +752,7 @@ def main():
     parser.add_argument("--dssp_executable", type=str, default=None)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--dry_run", action="store_true", help="Count unique and missing cache items, then exit.")
     args = parser.parse_args()
     args.verbose = True
 
@@ -817,13 +818,31 @@ def main():
     if args.legacy_feature_dir:
         legacy = load_legacy_feature_pickles(Path(args.legacy_feature_dir), set(args.feature_list) | {"graph"})
 
-    protein_written, protein_dims = _save_protein_payloads(unique_sequences, args.cache_dir, protein_tokenizer, args, legacy)
     # The original positional encoding depends on the molecule's column in its chunk of 100. The column comes from
     # the row order of the full task table, as in the original Dataset.csv.
     trfm_columns = trfm_column_map(args.base_dir / f"{args.task}_kinetic_params_1d.parquet")
     trfm_fp = trfm_fingerprint(trfm_columns)
     missing_columns = sum(smiles not in trfm_columns for smiles in unique_smiles)
     _log(f"TRFM columns: {len(trfm_columns)} SMILES in the full table | fingerprint {trfm_fp} | {missing_columns} split SMILES missing (column 0)", True)
+    if args.dry_run:
+        structures_present = _build_existing_structure_cache_index(args.cache_dir)
+        missing = {
+            "proteins": sum(not protein_cache_path(args.cache_dir, e["sequence"]).exists() for e in unique_sequences.values()),
+            "ligands": sum(not ligand_cache_path(args.cache_dir, e["smiles"], trfm_fp).exists() for e in unique_smiles.values()),
+            "structures": sum(
+                str(structure_cache_path(args.cache_dir, e["structure_id"], e["sequence"])) not in structures_present
+                for e in unique_structures.values()
+            ),
+        }
+        totals = {"proteins": len(unique_sequences), "ligands": len(unique_smiles), "structures": len(unique_structures)}
+        unresolved = sum(
+            _resolve_pdb_path(e, args) is None
+            for e in unique_structures.values()
+            if str(structure_cache_path(args.cache_dir, e["structure_id"], e["sequence"])) not in structures_present
+        )
+        _log(f"Dry run | unique {totals} | missing {missing} | missing structures without a PDB file: {unresolved}", True)
+        return
+    protein_written, protein_dims = _save_protein_payloads(unique_sequences, args.cache_dir, protein_tokenizer, args, legacy)
     ligand_written, ligand_dims = _save_ligand_payloads(unique_smiles, args.cache_dir, smiles_tokenizer, args, legacy, trfm_columns, trfm_fp)
     structure_written, structure_dims, structure_skipped = _save_structure_payloads(unique_structures, args.cache_dir, args, legacy)
 

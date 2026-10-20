@@ -28,12 +28,14 @@ DEFAULT_SPLIT_GROUPS = [
     "random_splits_grouped_smiles",
     "uniprot_time_splits",
     "enzyme_sequence_splits",
+    "enzyme_structure_splits",
     "substrate_splits",
+    "conformer_cosine_splits",
 ]
 SEEDS = [666, 777, 888]
 DEFAULT_FEATURES = ["trfm", "t5"]
 # Part of the cache folder names. Raise it when token, vector or graph definitions change.
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 KEY_COLUMNS = ["smiles", "sequence", "value", "smiles_hash", "uniprot_date", "log10_value"]
 
 COMMON_SEQUENCE_COLS = ["sequence", "Sequence"]

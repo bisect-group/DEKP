@@ -1,19 +1,18 @@
 import argparse
-import ast
 import json
-import re
+import os
 import sys
+from multiprocessing import get_context
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
+import biotite.structure as struc
+import biotite.structure.io.pdbx as pdbx
+import numpy as np
 import pandas as pd
-from Bio.Align import PairwiseAligner
-from Bio.PDB import PDBParser, is_aa
-from Bio.SeqUtils import seq1
 try:
     from src.utils.rich_progress import progress
 except ModuleNotFoundError:
-    import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from src.utils.rich_progress import progress
@@ -29,7 +28,6 @@ from emulator_bench.common import (
     TASKS,
     atomic_json,
     discover_split_jobs,
-    load_json,
     manifest_path,
     normalize_sequence,
     normalize_threshold_args,
@@ -41,12 +39,12 @@ from emulator_bench.common import (
 )
 
 
-DEFAULT_EXPERIMENTAL_PDB_DIR = INTERMEDIATE_DIR / "processed_exp_pdb"
+DEFAULT_MMCIF_DIR = INTERMEDIATE_DIR / "mmcif"
 DEFAULT_ALPHAFOLD_PDB_DIR = INTERMEDIATE_DIR / "alphafold"
 DEFAULT_ESM_PDB_DIR = INTERMEDIATE_DIR / "esmfold2_pdb"
 ESM_PDB_PREFIX = "ESMFold2-"
-PDB_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])([0-9][A-Za-z0-9]{3})(?![A-Za-z0-9])")
 STRUCTURE_MATCH_COLUMNS = ["smiles", "sequence", "value", "smiles_hash", "log10_value"]
+CANDIDATE_COLUMNS = ["pdbs", "pdb_source", "pdb_type", "pdb_chain", "pdb_coverage"]
 
 
 def _norm_text(value) -> str:
@@ -56,111 +54,60 @@ def _norm_text(value) -> str:
     return "" if text.lower() in {"nan", "none", "null", "nat"} else text
 
 
-def _extract_pdb_candidates(value) -> List[str]:
-    if value is None or pd.isna(value):
-        return []
-    if isinstance(value, (list, tuple, set)):
-        raw_items = [str(item) for item in value]
-    else:
-        text = _norm_text(value)
-        if not text:
-            return []
-        if text[0] in "[(" and text[-1] in "])":
-            try:
-                parsed = ast.literal_eval(text)
-            except Exception:
-                parsed = None
-            raw_items = [str(item) for item in parsed] if isinstance(parsed, (list, tuple, set)) else re.split(r"[,\s;]+", text)
-        else:
-            raw_items = re.split(r"[,\s;]+", text)
-
-    out, seen = [], set()
-    for item in raw_items:
-        token = Path(_norm_text(item)).stem
-        if not token:
-            continue
-        if "|" in token:
-            if token not in seen:
-                seen.add(token)
-                out.append(token)
-            continue
-        upper = token.upper()
-        if re.fullmatch(r"[0-9A-Z]{4}", upper):
-            if upper not in seen:
-                seen.add(upper)
-                out.append(upper)
-            continue
-        for match in PDB_ID_PATTERN.findall(upper):
-            if match not in seen:
-                seen.add(match)
-                out.append(match)
-    return out
-
-
-def _build_experimental_index(directory: Path) -> Dict[str, str]:
-    directory = Path(directory).expanduser()
-    return {path.stem.upper(): str(path) for path in directory.glob("*.pdb")} if directory.exists() else {}
+def mmcif_file(mmcif_dir: Path, pdb_id: str) -> Optional[Path]:
+    for name in (f"{pdb_id.upper()}_updated.cif", f"{pdb_id.upper()}.cif"):
+        if (Path(mmcif_dir) / name).exists():
+            return Path(mmcif_dir) / name
+    return None
 
 
 def _build_alphafold_index(directory: Path) -> Dict[str, str]:
+    """Accession to the newest `AF-<accession>-F1-model_v<n>.pdb`."""
     directory = Path(directory).expanduser()
-    if not directory.exists():
-        return {}
-    index: Dict[str, Tuple[int, str]] = {}
-    for path in directory.glob("AF-*-F1-model_v*.pdb"):
-        stem = path.stem
-        accession, _, version_text = stem[len("AF-") :].partition("-F1-model_v")
-        try:
-            version = int(version_text)
-        except ValueError:
-            version = -1
-        current = index.get(accession.upper())
-        if current is None or version > current[0]:
-            index[accession.upper()] = (version, str(path))
+    index: Dict[str, tuple] = {}
+    for path in directory.glob("AF-*-F1-model_v*.pdb") if directory.exists() else []:
+        accession, _, version_text = path.stem[len("AF-") :].partition("-F1-model_v")
+        version = int(version_text) if version_text.isdigit() else -1
+        if accession not in index or version > index[accession][0]:
+            index[accession] = (version, str(path))
     return {key: path for key, (_version, path) in index.items()}
 
 
 def _build_esm_index(directory: Path) -> Dict[str, str]:
+    """Row key (accession, or accession plus mutations) to `ESMFold2-<key>.pdb`."""
     directory = Path(directory).expanduser()
     if not directory.exists():
         return {}
-    index = {}
-    for path in directory.glob(f"{ESM_PDB_PREFIX}*.pdb"):
-        key = path.name[len(ESM_PDB_PREFIX) : -len(".pdb")]
-        index[key] = str(path)
-        index[key.upper()] = str(path)
-    return index
+    return {path.name[len(ESM_PDB_PREFIX) : -len(".pdb")]: str(path) for path in directory.glob(f"{ESM_PDB_PREFIX}*.pdb")}
 
 
-def _extract_pdb_sequences(path: str) -> List[dict]:
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure(Path(path).stem, path)
-    entries = []
-    for model in structure:
-        for chain in model:
-            residues = []
-            for residue in chain:
-                if is_aa(residue, standard=False):
-                    residues.append(seq1(residue.get_resname(), custom_map={"MSE": "M"}, undef_code="X"))
-            if residues:
-                entries.append({"chain_id": str(chain.id), "sequence": "".join(residues)})
-        break
-    return entries
+def extract_chain(cif_path: Path, chain_id: str, out_path: Path) -> None:
+    """Write the amino-acid atoms of one author chain as a PDB file that `parse_pdb` reads.
+
+    Residues are numbered 1..n so insertion codes do not merge residues.
+    """
+    atoms = pdbx.get_structure(pdbx.CIFFile.read(cif_path), model=1, use_author_fields=True)
+    atoms = atoms[struc.filter_amino_acids(atoms) & (atoms.chain_id == chain_id)]
+    if atoms.array_length() == 0:
+        raise ValueError(f"No amino-acid atoms for chain {chain_id} in {cif_path}")
+    starts = np.zeros(atoms.array_length(), dtype=int)
+    starts[struc.get_residue_starts(atoms)] = 1
+    residue_index = np.cumsum(starts)
+    lines = []
+    for serial, (atom_name, res_name, number, (x, y, z)) in enumerate(
+        zip(atoms.atom_name, atoms.res_name, residue_index, atoms.coord), start=1
+    ):
+        name = atom_name if len(atom_name) == 4 else f" {atom_name:<3}"
+        lines.append(f"ATOM  {serial % 100000:5d} {name} {res_name:>3} A{number % 10000:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00")
+    lines.append("TER")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = Path(f"{out_path}.tmp.{os.getpid()}")
+    tmp_path.write_text("\n".join(lines) + "\n")
+    tmp_path.replace(out_path)
 
 
-def _make_aligner():
-    aligner = PairwiseAligner(mode="global")
-    aligner.match_score = 1.0
-    aligner.mismatch_score = 0.0
-    aligner.open_gap_score = 0.0
-    aligner.extend_gap_score = 0.0
-    return aligner
-
-
-def _identity_pct(aligner, query: str, subject: str) -> float:
-    if not query or not subject:
-        return 0.0
-    return 100.0 * float(aligner.score(query, subject)) / max(len(query), len(subject))
+def _extract_chain_job(job: tuple) -> None:
+    extract_chain(*job)
 
 
 def _row_key(row: dict) -> str:
@@ -171,130 +118,75 @@ def _row_key(row: dict) -> str:
 def _candidate_lookup(candidate_df_path: Path) -> Dict[str, List[dict]]:
     path = Path(candidate_df_path).expanduser()
     frame = read_table(path)
-    require_columns(frame, KEY_COLUMNS + ["pdbs", "pdb_source", "pdb_type"], path)
+    require_columns(frame, KEY_COLUMNS + CANDIDATE_COLUMNS, path)
     lookup: Dict[str, List[dict]] = {}
-    columns = KEY_COLUMNS + ["pdbs", "pdb_source", "pdb_type"]
-    for row in frame[columns].to_dict("records"):
+    for row in frame[KEY_COLUMNS + CANDIDATE_COLUMNS].to_dict("records"):
         lookup.setdefault(_row_key(row), []).append(row)
-        seq_key = "sequence:" + stable_hash(normalize_sequence(row.get("sequence", "")))
-        lookup.setdefault(seq_key, []).append(row)
+        lookup.setdefault("sequence:" + stable_hash(normalize_sequence(row.get("sequence", ""))), []).append(row)
     return lookup
 
 
 class StructureResolver:
+    """One structure per row: the dataset's best-covering experimental chain, else AlphaFold, else ESMFold2."""
+
     def __init__(self, args):
-        self.experimental_index = _build_experimental_index(args.experimental_pdb_dir)
+        self.mmcif_dir = Path(args.mmcif_dir).expanduser()
+        self.chains_dir = Path(args.manifests_dir) / "_chains"
         self.alphafold_index = _build_alphafold_index(args.alphafold_pdb_dir)
         self.esm_index = _build_esm_index(args.esm_pdb_dir)
-        self.identity_threshold = float(args.identity_threshold)
-        self.aligner = _make_aligner()
-        cache_dir = Path(args.manifests_dir) / "_structure_alignment_cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        self.sequence_cache_path = cache_dir / "pdb_sequence_cache.json"
-        self.selection_cache_path = cache_dir / "selection_cache.json"
-        self.sequence_cache = load_json(self.sequence_cache_path, {})
-        self.selection_cache = load_json(self.selection_cache_path, {})
+        self.pending_chains: Dict[Path, tuple] = {}
 
-    def save(self):
-        atomic_json(self.sequence_cache_path, self.sequence_cache)
-        atomic_json(self.selection_cache_path, self.selection_cache)
-
-    def _pdb_sequences(self, pdb_id: str) -> List[dict]:
-        if pdb_id in self.sequence_cache:
-            return self.sequence_cache[pdb_id]
-        path = self.experimental_index[pdb_id]
-        try:
-            entries = _extract_pdb_sequences(path)
-        except Exception as exc:
-            entries = []
-            self.sequence_cache[f"{pdb_id}__error"] = str(exc)
-        self.sequence_cache[pdb_id] = entries
-        return entries
-
-    def resolve(self, row: dict, candidates: List[dict]) -> dict:
-        task_key = stable_hash(
-            json.dumps(
-                {
-                    "sequence": normalize_sequence(row.get("sequence", "")),
-                    "candidates": [
-                        [_norm_text(item.get("pdbs")), _norm_text(item.get("pdb_source")), _norm_text(item.get("pdb_type"))]
-                        for item in candidates
-                    ],
-                },
-                sort_keys=True,
-            )
-        )
-        if task_key in self.selection_cache:
-            return dict(self.selection_cache[task_key])
-
-        sequence = normalize_sequence(row.get("sequence", ""))
-        exp_candidates, alpha_candidates, esm_candidates = [], [], []
+    def _experimental(self, candidates: List[dict]) -> Optional[dict]:
+        best, best_coverage = None, -1.0
         for item in candidates:
-            pdbs = _norm_text(item.get("pdbs"))
-            source = _norm_text(item.get("pdb_source")).lower()
-            kind = _norm_text(item.get("pdb_type")).lower()
-            if kind == "experimental" or source == "pdbe":
-                exp_candidates.extend(pdb for pdb in _extract_pdb_candidates(pdbs) if pdb.upper() in self.experimental_index)
-            elif kind == "predicted" and source == "alphafold":
-                accession = pdbs.split("|", 1)[0].upper()
-                if accession in self.alphafold_index:
-                    alpha_candidates.append(accession)
-            else:
-                key = pdbs if pdbs in self.esm_index else pdbs.upper()
-                if key in self.esm_index:
-                    esm_candidates.append(key)
+            pdb_id, _, accession = _norm_text(item.get("pdbs")).partition(":")
+            chain = _norm_text(item.get("pdb_chain"))
+            cif_path = mmcif_file(self.mmcif_dir, pdb_id) if pdb_id and chain else None
+            coverage = float(item["pdb_coverage"]) if pd.notna(item.get("pdb_coverage")) else 0.0
+            if _norm_text(item.get("pdb_type")).lower() == "experimental" and cif_path and coverage > best_coverage:
+                best, best_coverage = (pdb_id.upper(), accession, chain, cif_path), coverage
+        if best is None:
+            return None
+        pdb_id, accession, chain, cif_path = best
+        out_path = self.chains_dir / f"{pdb_id}_{chain}.pdb"
+        if not out_path.exists():
+            self.pending_chains[out_path] = (cif_path, chain, out_path)
+        return {
+            "structure_path": str(out_path),
+            "pdbs": f"{pdb_id}:{accession}",
+            "pdb_source": "PDBe",
+            "pdb_type": "experimental",
+            "chain_id": chain,
+            "resolved_structure_status": "selected_experimental",
+            "resolved_structure_coverage": round(best_coverage, 4),
+        }
 
-        best_pdb, best_chain, best_identity = None, "", -1.0
-        for pdb_id in sorted(set(p.upper() for p in exp_candidates)):
-            for entry in self._pdb_sequences(pdb_id):
-                identity = _identity_pct(self.aligner, sequence, normalize_sequence(entry.get("sequence", "")))
-                if identity > best_identity:
-                    best_pdb, best_chain, best_identity = pdb_id, str(entry.get("chain_id", "")), identity
+    def _predicted(self, uniprot_id: str) -> Optional[dict]:
+        accession = uniprot_id.split("|", 1)[0].strip()
+        if accession in self.alphafold_index:
+            return {"structure_path": self.alphafold_index[accession], "pdbs": accession, "pdb_source": "AlphaFold",
+                    "pdb_type": "predicted", "chain_id": "A", "resolved_structure_status": "selected_alphafold"}
+        key = next((k for k in (uniprot_id.strip(), accession) if k in self.esm_index), None)
+        if key is not None:
+            return {"structure_path": self.esm_index[key], "pdbs": key, "pdb_source": "ESM",
+                    "pdb_type": "predicted", "chain_id": "A", "resolved_structure_status": "selected_esm"}
+        return None
 
-        if best_pdb and best_identity >= self.identity_threshold:
-            result = {
-                "structure_path": self.experimental_index[best_pdb],
-                "pdbs": best_pdb,
-                "pdb_source": "PDBe",
-                "pdb_type": "experimental",
-                "chain_id": best_chain or "A",
-                "resolved_structure_status": "selected_experimental",
-                "resolved_structure_identity": round(best_identity, 4),
-            }
-        elif alpha_candidates:
-            accession = sorted(set(alpha_candidates))[0]
-            result = {
-                "structure_path": self.alphafold_index[accession],
-                "pdbs": accession,
-                "pdb_source": "AlphaFold",
-                "pdb_type": "predicted",
-                "chain_id": "A",
-                "resolved_structure_status": "selected_alphafold",
-                "resolved_structure_identity": None if best_identity < 0 else round(best_identity, 4),
-            }
-        elif esm_candidates:
-            key = sorted(set(esm_candidates))[0]
-            result = {
-                "structure_path": self.esm_index[key],
-                "pdbs": key,
-                "pdb_source": "ESM",
-                "pdb_type": "predicted",
-                "chain_id": "A",
-                "resolved_structure_status": "selected_esm",
-                "resolved_structure_identity": None if best_identity < 0 else round(best_identity, 4),
-            }
-        else:
-            result = {
-                "structure_path": "",
-                "pdbs": "",
-                "pdb_source": "",
-                "pdb_type": "",
-                "chain_id": "",
-                "resolved_structure_status": "unresolved",
-                "resolved_structure_identity": None if best_identity < 0 else round(best_identity, 4),
-            }
-        self.selection_cache[task_key] = result
-        return dict(result)
+    def resolve(self, row: dict, candidate_groups: List[List[dict]]) -> dict:
+        for candidates in candidate_groups:
+            result = self._experimental(candidates)
+            if result:
+                return result
+        return self._predicted(_norm_text(row.get("uniprot_id"))) or {"structure_path": "", "resolved_structure_status": "unresolved"}
+
+    def extract_pending(self, workers: int) -> None:
+        jobs = list(self.pending_chains.values())
+        self.pending_chains = {}
+        if not jobs:
+            return
+        with get_context("fork").Pool(min(workers, len(jobs))) as pool:
+            for _ in progress(pool.imap_unordered(_extract_chain_job, jobs, chunksize=16), total=len(jobs), desc="Extracting chains", unit="chain"):
+                pass
 
 
 def _sample_id(row: dict) -> str:
@@ -311,17 +203,7 @@ def prepare_one_split(path: Path, output_path: Path, candidates: Dict[str, List[
     for row in progress(frame.to_dict("records"), desc=f"Preparing {path.parent.name}/{path.name}", unit="row"):
         exact_candidates = candidates.get(_row_key(row), [])
         sequence_candidates = candidates.get("sequence:" + stable_hash(normalize_sequence(row.get("sequence", ""))), [])
-        candidate_groups = [exact_candidates]
-        if sequence_candidates and sequence_candidates != exact_candidates:
-            candidate_groups.append(sequence_candidates)
-
-        result = {}
-        for row_candidates in candidate_groups:
-            if not row_candidates:
-                continue
-            result = resolver.resolve(row, row_candidates)
-            if result.get("structure_path"):
-                break
+        result = resolver.resolve(row, [exact_candidates, sequence_candidates])
         if not result.get("structure_path"):
             failed += 1
             if args.fail_on_unresolved:
@@ -332,6 +214,7 @@ def prepare_one_split(path: Path, output_path: Path, candidates: Dict[str, List[
         out["target"] = float(row[args.target_col])
         out.update(result)
         rows.append(out)
+    resolver.extract_pending(args.workers)
     out_frame = pd.DataFrame(rows)
     write_table(output_path, out_frame)
     return {
@@ -340,6 +223,7 @@ def prepare_one_split(path: Path, output_path: Path, candidates: Dict[str, List[
         "rows_in": int(len(frame)),
         "rows_out": int(len(out_frame)),
         "rows_unresolved": int(failed),
+        "by_source": out_frame["resolved_structure_status"].value_counts().to_dict() if len(out_frame) else {},
     }
 
 
@@ -364,10 +248,10 @@ def main():
     parser.add_argument("--threshold", type=str, default=None)
     parser.add_argument("--thresholds", nargs="+", default=None)
     parser.add_argument("--target_col", type=str, default="log10_value")
-    parser.add_argument("--identity_threshold", type=float, default=90.0)
-    parser.add_argument("--experimental_pdb_dir", type=Path, default=DEFAULT_EXPERIMENTAL_PDB_DIR)
+    parser.add_argument("--mmcif_dir", type=Path, default=DEFAULT_MMCIF_DIR)
     parser.add_argument("--alphafold_pdb_dir", type=Path, default=DEFAULT_ALPHAFOLD_PDB_DIR)
     parser.add_argument("--esm_pdb_dir", type=Path, default=DEFAULT_ESM_PDB_DIR)
+    parser.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 1), help="Processes that extract chains from mmCIF files.")
     parser.add_argument("--limit_rows", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--fail_on_unresolved", action="store_true")
@@ -377,7 +261,7 @@ def main():
     args.base_dir = Path(args.base_dir or paths["base_dir"]).expanduser()
     args.manifests_dir = Path(args.manifests_dir or paths["manifests_dir"]).expanduser()
     args.candidate_df_path = args.candidate_df_path or args.base_dir / f"{args.task}_kinetic_params_3d.parquet"
-    args.experimental_pdb_dir = Path(args.experimental_pdb_dir).expanduser()
+    args.mmcif_dir = Path(args.mmcif_dir).expanduser()
     args.alphafold_pdb_dir = Path(args.alphafold_pdb_dir).expanduser()
     args.esm_pdb_dir = Path(args.esm_pdb_dir).expanduser()
     args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
@@ -396,9 +280,7 @@ def main():
                 summaries.append({"output_path": str(out_path), "status": "skipped_exists"})
                 continue
             summaries.append(prepare_one_split(Path(job[f"{split}_path"]), out_path, candidates, resolver, args))
-            resolver.save()
 
-    resolver.save()
     summary = {"jobs": len(jobs), "splits": summaries}
     atomic_json(args.manifests_dir / "prepare_summary.json", summary)
     print(json.dumps(summary, indent=2))
