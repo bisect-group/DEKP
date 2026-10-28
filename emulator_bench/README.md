@@ -22,3 +22,22 @@ Input: `data/processed/datasets/kinetic_dataset/<task>/<split_group>[/threshold_
 Rows without a structure are dropped, as in the original model.
 
 Output: `outputs/baselines/DEKP/<task>/<split_group>/<split_name>/seed_<s>/`, with summaries in `outputs/baselines/DEKP/<task>/`. A split group without threshold folders uses `all` as `<split_name>`.
+
+## Verify equivalence
+
+```
+emulator_bench/verify_equivalence.sh          # CPU, fp32, about 20 s
+emulator_bench/verify_equivalence.sh --gpu    # also the bf16 tests; needs one CUDA device
+emulator_bench/verify_equivalence.sh --negative-control  # the bf16 test must FAIL
+```
+
+Expected env: `mldb` (torch, torch_geometric, biotite, scikit-learn, pytest). The script does not create it. It fails if any CPU test is skipped. It needs no private data: it builds a toy cache and synthetic structures.
+
+What `tests/test_original_equivalence.py` compares:
+- Training: the loop of `DEKP/pretrain.py` against the wrapper loop (persistent workers, RNG sync, memory-mapped cache, `_prefetch`). Batch hashes, per-step losses and final weights must be identical. The original `pretrain.py` unpacks five batch items where its dataset returns nine, so the test runs its loop statements with the nine items unpacked.
+- Persistent workers: without `_sync_rng` the shuffle order changes from epoch 2 on.
+- Latents and Extra Trees: `fine_tune.prepare_ds` against `extract_latents`. Predictions must be identical.
+- Graphs: `build_graph_from_pdb` against the original `get_graph_fea`, and `extract_chain` against whole-entry PDB files. With local structure data the test uses real files.
+- `--gpu`: bf16 autocast with the side-stream copy and `cudnn.benchmark` (as in the training script on CUDA) against fp32 on the same GPU. Dropout is removed from all runs, because dropout masks differ between dtypes. The toy is calm: 96 rows, batch 48, lr 1e-4, 3 epochs, so the bf16 noise floor is small. The noise control is the production run with initial weights perturbed by one rounding of the production dtype (2**-8, bf16). Per step, the gap |production - fp32| must be at most 10 times the floor |perturbed production - production|. The same holds for the final MSE. Step 0 is judged like every other step: its gap must be at most 10 times its floor. Each test prints `max gap`, `max floor` and `ratio`; run with `-s` to see the line. The side-stream batches must equal the plain loader batches. `--negative-control` reruns the bf16 test with the production run's initial weights multiplied by 1.05 (`EQUIV_NEGATIVE_CONTROL=1`). It must fail, and the script exits 0 only then. The test does not cover `--compile_model`: the run records do not show that production runs used it.
+
+Not exact: bf16 training (production setting) differs from fp32 by rounding. With pyg-lib the original `get_graph_fea` returns edges longer than the radius, so the graph test compares with a contiguous copy (see `REPORT.md`). The original `ExtraTreesRegressor` has no seed, so the wrapper seeds it.
