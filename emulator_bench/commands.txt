@@ -1,0 +1,16 @@
+# DEKP paper commands (km, kcat). Run from the submodule root. emulator_bench/run.sh runs all of them.
+# Env: PY GPUS RUNS_PER_GPU SEEDS DATA_ROOT OUT_ROOT EMULATOR_ROOT. We used the conda env mldb.
+export PY=python
+DATA=../../data/processed/datasets/kinetic_dataset
+OUT=../../outputs/baselines/DEKP
+
+for task in km kcat; do
+  # 1) One structure per row (writes manifests, never edits the split files).
+  $PY emulator_bench/prepare_splits.py --task $task --base_dir $DATA/$task --manifests_dir $OUT/$task/manifests
+  # 2) Caches (ProtT5, SMILES Transformer, graphs), then 3 seeds on every split, bf16 network (Extra Trees stays on CPU).
+  #    Original settings otherwise: 200 epochs, batch 256, lr 1e-3. Summaries: $OUT/$task/dekp_summary_{runs,thresholds,by_split_group,ranked}.csv
+  $PY emulator_bench/run_split_benchmarks.py --task $task --base_dir $DATA/$task --manifests_dir $OUT/$task/manifests \
+    --cache_dir $OUT/$task/embeddings --out_dir $OUT/$task --seeds 666 777 888 --gpus 0 --runs_per_gpu 1 --amp
+done
+
+# Count missing cache items first: $PY emulator_bench/cache_embeddings.py --task kcat --dry_run

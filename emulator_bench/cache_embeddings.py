@@ -1,0 +1,892 @@
+import argparse
+import gc
+import os
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+try:
+    from src.utils.rich_progress import progress
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from emulator_bench.common import (
+    CACHE_VERSION,
+    COMMON_CID_COLS,
+    COMMON_PROTEIN_ID_COLS,
+    COMMON_SEQUENCE_COLS,
+    COMMON_SMILES_COLS,
+    COMMON_STRUCTURE_ID_COLS,
+    DEFAULT_FEATURES,
+    DEFAULT_SPLIT_GROUPS,
+    TASKS,
+    apply_manifest_paths_to_jobs,
+    canonical_pdb_identity,
+    discover_split_jobs,
+    find_first_existing_column,
+    normalize_sequence,
+    normalize_threshold_args,
+    protein_cache_path,
+    ligand_cache_path,
+    trfm_column_map,
+    trfm_fingerprint,
+    save_json,
+    structure_cache_path,
+    structures_cache_dir,
+    task_paths,
+    read_table,
+)
+from emulator_bench.feature_pipeline import (
+    build_graph_from_pdb,
+    build_graph_from_array,
+    compute_dssp_feature,
+    embed_prot_t5,
+    embed_smiles_trfm_batch,
+    load_legacy_feature_pickles,
+    load_prot_t5,
+    load_smiles_transformer,
+    parse_pdb_to_array,
+    resolve_legacy_feature,
+)
+from emulator_bench.bench_tokenizers import load_protein_tokenizer, load_smiles_tokenizer, protein_token_ids, smiles_token_ids
+
+
+def _log(message: str, enabled: bool = True) -> None:
+    if enabled:
+        print(message, flush=True)
+
+
+def _atomic_torch_save(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = Path(str(path) + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+
+
+def _coerce_feature_tensor(value, dtype: torch.dtype) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu()
+    else:
+        tensor = torch.as_tensor(np.asarray(value))
+    if tensor.ndim > 1:
+        tensor = tensor.float().mean(dim=0)
+    return tensor.reshape(-1).to(dtype=dtype)
+
+
+def _cleanup_torch_memory(device: torch.device | str | None = None) -> None:
+    gc.collect()
+    if device is None:
+        return
+    device_str = str(device)
+    if device_str.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+
+def _normalize_series(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip()
+
+
+def _build_pdb_indexes(args) -> dict:
+    indexes = {
+        "experimental": {},
+        "alphafold": {},
+        "esm3": {},
+    }
+
+    if args.experimental_pdb_dir:
+        pdb_dir = Path(args.experimental_pdb_dir).expanduser()
+        if pdb_dir.exists():
+            for path in pdb_dir.glob(f"*{args.pdb_suffix}"):
+                indexes["experimental"][path.name] = path
+                indexes["experimental"][path.stem] = path
+
+    if args.alphafold_pdb_dir:
+        pdb_dir = Path(args.alphafold_pdb_dir).expanduser()
+        if pdb_dir.exists():
+            for path in pdb_dir.glob("AF-*-F1-model_v*.pdb"):
+                stem = path.stem
+                prefix = "AF-"
+                middle = "-F1-model_v"
+                if stem.startswith(prefix) and middle in stem:
+                    uniprot_id, _, version_text = stem[len(prefix):].partition(middle)
+                    try:
+                        version = int(version_text)
+                    except ValueError:
+                        version = -1
+                    current = indexes["alphafold"].get(uniprot_id)
+                    if current is None or version > current[0]:
+                        indexes["alphafold"][uniprot_id] = (version, path)
+
+    if args.esm_pdb_dir:
+        pdb_dir = Path(args.esm_pdb_dir).expanduser()
+        if pdb_dir.exists():
+            for path in pdb_dir.glob("ESMFold2-*.pdb"):
+                key = path.name[len("ESMFold2-") : -len(".pdb")]
+                indexes["esm3"][key] = path
+
+    return indexes
+
+
+def _build_existing_structure_cache_index(cache_dir: Path) -> set[str]:
+    structures_dir = structures_cache_dir(cache_dir)
+    if not structures_dir.exists():
+        return set()
+    return {str(path) for path in structures_dir.rglob("*.pt")}
+
+
+def _scan_split_file(payload: dict) -> dict:
+    frame = read_table(Path(payload["path"]))
+    sequence_col = payload["column_names"]["sequence_col"]
+    smiles_col = payload["column_names"]["smiles_col"]
+    protein_id_col = payload["column_names"]["protein_id_col"]
+    structure_id_col = payload["column_names"]["structure_id_col"]
+    cid_col = payload["column_names"]["cid_col"]
+    pdb_type_col = payload["column_names"]["pdb_type_col"]
+    pdb_source_col = payload["column_names"]["pdb_source_col"]
+    pdb_record_col = payload["column_names"]["pdb_record_col"]
+    structure_path_col = payload["column_names"].get("structure_path_col")
+
+    unique_sequences = {}
+    unique_smiles = {}
+    unique_structures = {}
+
+    for _, row in frame.iterrows():
+        sequence = normalize_sequence(row[sequence_col])
+        smiles = str(row[smiles_col]).strip()
+        protein_id = str(row[protein_id_col]) if protein_id_col else sequence
+        structure_id = str(row[structure_id_col]) if structure_id_col else protein_id
+        cid_value = None
+        if cid_col and cid_col in row.index:
+            cid_value = row[cid_col]
+        pdb_type = None
+        if pdb_type_col and pdb_type_col in row.index:
+            pdb_type = row[pdb_type_col]
+        pdb_source = None
+        if pdb_source_col and pdb_source_col in row.index:
+            pdb_source = row[pdb_source_col]
+        pdb_record = None
+        if pdb_record_col and pdb_record_col in row.index:
+            pdb_record = row[pdb_record_col]
+        structure_path = ""
+        if structure_path_col and structure_path_col in row.index:
+            structure_path = str(row[structure_path_col]).strip()
+        pdb_identity = canonical_pdb_identity(pdb_type, pdb_source, pdb_record, structure_id, protein_id)
+
+        if sequence not in unique_sequences:
+            unique_sequences[sequence] = {
+                "sequence": sequence,
+                "raw_sequence": str(row[sequence_col]),
+                "protein_id": protein_id,
+                "structure_id": structure_id,
+            }
+        if smiles not in unique_smiles:
+            unique_smiles[smiles] = {
+                "smiles": smiles,
+                "cid": cid_value,
+            }
+        pdb_key = str(pdb_record or structure_id or protein_id).strip()
+        if pdb_identity and pdb_identity not in unique_structures:
+            unique_structures[pdb_identity] = {
+                "structure_id": pdb_key,
+                "protein_id": protein_id,
+                "sequence": sequence,
+                "pdb_type": pdb_type,
+                "pdb_source": pdb_source,
+                "pdb_record": pdb_record,
+                "original_structure_id": structure_id,
+                "structure_path": structure_path,
+            }
+
+    return {
+        "path": payload["path"],
+        "split_group": payload["split_group"],
+        "split_name": payload["split_name"],
+        "rows": len(frame),
+        "unique_sequences": unique_sequences,
+        "unique_smiles": unique_smiles,
+        "unique_structures": unique_structures,
+    }
+
+
+def _resolve_pdb_path(entry: dict, args) -> Path | None:
+    structure_path = str(entry.get("structure_path") or "").strip()
+    if structure_path:
+        path = Path(structure_path).expanduser()
+        if path.exists():
+            return path
+
+    pdb_indexes = getattr(args, "_pdb_indexes", None)
+    pdb_record_id = str(entry.get("pdb_record") or entry.get("structure_id") or entry.get("protein_id") or "").strip()
+    pdb_type = str(entry.get("pdb_type") or "").strip().lower()
+    pdb_source = str(entry.get("pdb_source") or "").strip()
+    pdb_source_lower = pdb_source.lower()
+    pdb_record = str(entry.get("pdb_record") or "").strip()
+    if "|" in pdb_record:
+        if pdb_indexes is None:
+            return None
+        return pdb_indexes["esm3"].get(pdb_record)
+
+    if pdb_type == "experimental":
+        if pdb_indexes is None:
+            return None
+        candidates = []
+        if pdb_record:
+            candidates.append(pdb_record)
+            if "." not in Path(pdb_record).name:
+                candidates.append(f"{pdb_record}{args.pdb_suffix}")
+        for key in [entry.get("structure_id"), entry.get("protein_id")]:
+            if key:
+                key = str(key).strip()
+                candidates.append(key)
+                if "." not in Path(key).name:
+                    candidates.append(f"{key}{args.pdb_suffix}")
+        seen = set()
+        for candidate_name in candidates:
+            if not candidate_name or candidate_name in seen:
+                continue
+            seen.add(candidate_name)
+            candidate = pdb_indexes["experimental"].get(candidate_name)
+            if candidate is not None:
+                return candidate
+
+    if pdb_type == "predicted" and pdb_source_lower == "alphafold" and pdb_record_id:
+        if pdb_indexes is None:
+            return None
+        match = pdb_indexes["alphafold"].get(pdb_record_id)
+        if match is not None:
+            return match[1]
+
+    if pdb_type == "predicted" and (pdb_source == "" or pdb_source_lower == "nan") and pdb_record_id:
+        if pdb_indexes is None:
+            return None
+        candidate = pdb_indexes["esm3"].get(pdb_record_id)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _build_graph_worker(payload: dict) -> dict:
+    graph = build_graph_from_pdb(
+        Path(payload["pdb_path"]),
+        atom_type=str(payload["graph_atom_type"]),
+        device="cpu",
+    )
+    return {
+        "structure_key": payload["structure_key"],
+        "graph": graph,
+    }
+
+
+def _parse_pdb_worker(payload: dict) -> dict:
+    pdb_array = parse_pdb_to_array(
+        Path(payload["pdb_path"]),
+        atom_type=str(payload["graph_atom_type"]),
+    )
+    return {
+        "structure_key": payload["structure_key"],
+        "pdb_array": pdb_array,
+    }
+
+
+def _finalize_structure_payload(path: Path, payload: dict, entry: dict, args, legacy, dtype: torch.dtype):
+    feature_dims = {}
+    if "pst" in args.feature_list:
+        legacy_value = resolve_legacy_feature(legacy.get("pst"), entry["protein_id"], entry["structure_id"])
+        if legacy_value is None:
+            raise RuntimeError(
+                "Requested `pst` features but no usable legacy pst.pkl entry was available. "
+                "Provide --legacy_feature_dir with pst.pkl or remove pst from --feature_list."
+            )
+        tensor = _coerce_feature_tensor(legacy_value, dtype=dtype)
+        payload["pst"] = tensor
+        feature_dims["pst"] = int(tensor.numel())
+
+    if "dssp" in args.feature_list:
+        legacy_value = resolve_legacy_feature(legacy.get("dssp"), entry["protein_id"], entry["structure_id"])
+        if legacy_value is not None:
+            tensor = _coerce_feature_tensor(legacy_value, dtype=dtype)
+        else:
+            pdb_path = _resolve_pdb_path(entry, args)
+            if pdb_path is None:
+                raise RuntimeError(
+                    f"Requested `dssp` features but no PDB could be resolved for structure `{entry['structure_id']}`."
+                )
+            tensor = torch.as_tensor(
+                compute_dssp_feature(Path(pdb_path), dssp_executable=args.dssp_executable),
+                dtype=dtype,
+            )
+        payload["dssp"] = tensor
+        feature_dims["dssp"] = int(tensor.numel())
+
+    try:
+        _atomic_torch_save(path, payload)
+        return feature_dims
+    finally:
+        # Structure graphs can be large; drop them as soon as the cache file exists.
+        payload.pop("graph", None)
+        payload.pop("pst", None)
+        payload.pop("dssp", None)
+
+
+def _update_feature_dims_from_payload(payload: dict, feature_dims: dict, requested_features) -> None:
+    for feature_name in requested_features:
+        if feature_name in payload and feature_name != "graph":
+            feature_dims[feature_name] = int(torch.as_tensor(payload[feature_name]).numel())
+
+
+def _make_structure_payload(entry: dict) -> dict:
+    return {
+        "structure_id": entry["structure_id"],
+        "protein_id": entry["protein_id"],
+    }
+
+
+def _maybe_cleanup_torch_memory(processed_count: int, interval: int, device: torch.device | str | None = None) -> None:
+    if interval > 0 and processed_count % interval == 0:
+        _cleanup_torch_memory(device)
+
+
+def _iter_unique_rows(jobs, column_names):
+    tasks = []
+    for job in jobs:
+        for split_key in ("train_path", "val_path", "test_path"):
+            path = Path(job[split_key])
+            tasks.append(
+                {
+                    "path": str(path),
+                    "split_group": job["split_group"],
+                    "split_name": job["split_name"],
+                    "column_names": column_names,
+                }
+            )
+
+    if not tasks:
+        return {}, {}, {}
+
+    unique_sequences = {}
+    unique_smiles = {}
+    unique_structures = {}
+
+    max_workers = min(len(tasks), os.cpu_count() or 1)
+    _log(f"Scanning {len(tasks)} split files with up to {max_workers} worker processes", True)
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_scan_split_file, payload) for payload in tasks]
+        for future in progress(as_completed(futures), total=len(futures), desc="Scanning split files", unit="file"):
+            result = future.result()
+            unique_sequences.update(result["unique_sequences"])
+            unique_smiles.update(result["unique_smiles"])
+            unique_structures.update(result["unique_structures"])
+
+    return unique_sequences, unique_smiles, unique_structures
+
+
+def _resolve_columns(frame, args):
+    return {
+        "sequence_col": find_first_existing_column(frame, COMMON_SEQUENCE_COLS, explicit=args.sequence_col, required=True),
+        "smiles_col": find_first_existing_column(frame, COMMON_SMILES_COLS, explicit=args.smiles_col, required=True),
+        "protein_id_col": find_first_existing_column(frame, COMMON_PROTEIN_ID_COLS, explicit=args.protein_id_col, required=False),
+        "structure_id_col": find_first_existing_column(frame, COMMON_STRUCTURE_ID_COLS, explicit=args.structure_id_col, required=False),
+        "cid_col": find_first_existing_column(frame, COMMON_CID_COLS, explicit=args.cid_col, required=False),
+        "pdb_type_col": args.pdb_type_col if args.pdb_type_col and args.pdb_type_col in frame.columns else ("pdb_type" if "pdb_type" in frame.columns else None),
+        "pdb_source_col": args.pdb_source_col if args.pdb_source_col and args.pdb_source_col in frame.columns else ("pdb_source" if "pdb_source" in frame.columns else None),
+        "pdb_record_col": args.pdb_record_col if args.pdb_record_col and args.pdb_record_col in frame.columns else ("pdbs" if "pdbs" in frame.columns else None),
+        "structure_path_col": "structure_path" if "structure_path" in frame.columns else None,
+    }
+
+
+def _save_protein_payloads(unique_sequences, cache_dir: Path, protein_tokenizer, args, legacy):
+    dtype = torch.float16 if args.cache_dtype == "float16" else torch.float32
+    pending_t5 = []
+    feature_dims = {}
+    written = 0
+    _log(
+        f"Protein cache: {len(unique_sequences)} unique sequences | dtype={args.cache_dtype}",
+        args.verbose,
+    )
+
+    for entry in unique_sequences.values():
+        path = protein_cache_path(cache_dir, entry["sequence"])
+        if path.exists() and not args.overwrite:
+            if "t5" in args.feature_list and "t5" not in feature_dims:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+                _update_feature_dims_from_payload(payload, feature_dims, args.feature_list)
+            continue
+        if "t5" in args.feature_list:
+            legacy_value = resolve_legacy_feature(legacy.get("t5"), entry["protein_id"], entry["sequence"])
+            if legacy_value is not None:
+                payload = {
+                    "sequence": entry["sequence"],
+                    "protein_id": entry["protein_id"],
+                    "token_ids": torch.tensor(protein_token_ids(protein_tokenizer, entry["raw_sequence"]), dtype=torch.long),
+                }
+                tensor = _coerce_feature_tensor(legacy_value, dtype=dtype)
+                payload["t5"] = tensor
+                feature_dims["t5"] = int(tensor.numel())
+                _atomic_torch_save(path, payload)
+                written += 1
+            else:
+                pending_t5.append(
+                    {
+                        "sequence": entry["sequence"],
+                        "raw_sequence": entry["raw_sequence"],
+                        "protein_id": entry["protein_id"],
+                        "path": path,
+                    }
+                )
+                continue
+        else:
+            payload = {
+                "sequence": entry["sequence"],
+                "protein_id": entry["protein_id"],
+                "token_ids": torch.tensor(protein_token_ids(protein_tokenizer, entry["raw_sequence"]), dtype=torch.long),
+            }
+            _atomic_torch_save(path, payload)
+            written += 1
+
+    if pending_t5:
+        device = torch.device(args.device)
+        _log(f"ProtT5 phase: loading model on {device}", args.verbose)
+        model, tokenizer = load_prot_t5(args.prot_t5_model, device=device)
+        _log(f"ProtT5 phase: {len(pending_t5)} sequences require direct computation", args.verbose)
+        for item in progress(pending_t5, desc="Caching ProtT5", unit="seq"):
+            tensor = torch.as_tensor(embed_prot_t5(model, tokenizer, item["raw_sequence"], device), dtype=dtype)
+            payload = {
+                "sequence": item["sequence"],
+                "protein_id": item["protein_id"],
+                "token_ids": torch.tensor(protein_token_ids(protein_tokenizer, item["raw_sequence"]), dtype=torch.long),
+                "t5": tensor,
+            }
+            feature_dims["t5"] = int(tensor.numel())
+            _atomic_torch_save(item["path"], payload)
+            written += 1
+        del model
+        del tokenizer
+        _cleanup_torch_memory(device)
+
+    return written, feature_dims
+
+
+def _save_ligand_payloads(unique_smiles, cache_dir: Path, smiles_tokenizer, args, legacy, trfm_columns, fingerprint):
+    dtype = torch.float16 if args.cache_dtype == "float16" else torch.float32
+    pending_trfm = []
+    pending_lookup = {}
+    feature_dims = {}
+    written = 0
+    _log(
+        f"Ligand cache: {len(unique_smiles)} unique SMILES | dtype={args.cache_dtype}",
+        args.verbose,
+    )
+
+    for entry in unique_smiles.values():
+        path = ligand_cache_path(cache_dir, entry["smiles"], fingerprint)
+        if path.exists() and not args.overwrite:
+            if (
+                ("trfm" in args.feature_list and "trfm" not in feature_dims)
+                or ("molformer" in args.feature_list and "molformer" not in feature_dims)
+            ):
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+                _update_feature_dims_from_payload(payload, feature_dims, args.feature_list)
+            continue
+        payload = None
+        if "trfm" in args.feature_list:
+            legacy_value = None
+            if legacy.get("trfm") is not None:
+                cid_value = entry.get("cid")
+                if cid_value is not None:
+                    legacy_value = resolve_legacy_feature(legacy.get("trfm"), cid_value)
+                if legacy_value is None:
+                    legacy_value = resolve_legacy_feature(legacy.get("trfm"), entry["smiles"])
+            if legacy_value is not None:
+                payload = {
+                    "smiles": entry["smiles"],
+                    "cid": entry.get("cid"),
+                    "token_ids": torch.tensor(smiles_token_ids(smiles_tokenizer, entry["smiles"]), dtype=torch.long),
+                }
+                tensor = _coerce_feature_tensor(legacy_value, dtype=dtype)
+                payload["trfm"] = tensor
+                feature_dims["trfm"] = int(tensor.numel())
+            else:
+                pending_trfm.append(entry["smiles"])
+                pending_lookup[entry["smiles"]] = {
+                    "cid": entry.get("cid"),
+                    "path": path,
+                }
+        if "molformer" in args.feature_list:
+            legacy_value = None
+            if legacy.get("molformer") is not None:
+                cid_value = entry.get("cid")
+                if cid_value is not None:
+                    legacy_value = resolve_legacy_feature(legacy.get("molformer"), cid_value)
+                if legacy_value is None:
+                    legacy_value = resolve_legacy_feature(legacy.get("molformer"), entry["smiles"])
+            if legacy_value is None:
+                raise RuntimeError(
+                    "Requested `molformer` features but no usable legacy molformer.pkl entry was available. "
+                    "Provide --legacy_feature_dir with molformer.pkl or remove molformer from --feature_list."
+                )
+            if payload is None:
+                payload = {
+                    "smiles": entry["smiles"],
+                    "cid": entry.get("cid"),
+                    "token_ids": torch.tensor(smiles_token_ids(smiles_tokenizer, entry["smiles"]), dtype=torch.long),
+                }
+            tensor = _coerce_feature_tensor(legacy_value, dtype=dtype)
+            payload["molformer"] = tensor
+            feature_dims["molformer"] = int(tensor.numel())
+        if payload is None and "trfm" not in args.feature_list:
+            payload = {
+                "smiles": entry["smiles"],
+                "cid": entry.get("cid"),
+                "token_ids": torch.tensor(smiles_token_ids(smiles_tokenizer, entry["smiles"]), dtype=torch.long),
+            }
+        if payload is not None and ("trfm" not in args.feature_list or "trfm" in payload):
+            _atomic_torch_save(path, payload)
+            written += 1
+
+    if pending_trfm:
+        device = torch.device(args.device)
+        _log(f"SMILES Transformer phase: loading model on {device}", args.verbose)
+        model, vocab = load_smiles_transformer(
+            weights_path=args.trfm_weights_path,
+            vocab_path=args.trfm_vocab_path,
+            device=device,
+        )
+        smiles_values = list(pending_trfm)
+        _log(f"SMILES Transformer phase: {len(smiles_values)} SMILES require direct computation", args.verbose)
+        for start in progress(range(0, len(smiles_values), args.trfm_batch_size), desc="Caching TRFM", unit="batch"):
+            batch_smiles = smiles_values[start : start + args.trfm_batch_size]
+            columns = [trfm_columns.get(smiles, 0) for smiles in batch_smiles]
+            embedded = embed_smiles_trfm_batch(batch_smiles, columns, model=model, vocab=vocab, device=device)
+            for smiles in batch_smiles:
+                item = pending_lookup[smiles]
+                payload = {
+                    "smiles": smiles,
+                    "cid": item["cid"],
+                    "token_ids": torch.tensor(smiles_token_ids(smiles_tokenizer, smiles), dtype=torch.long),
+                }
+                tensor = torch.as_tensor(embedded[smiles], dtype=dtype)
+                payload["trfm"] = tensor
+                feature_dims["trfm"] = int(tensor.numel())
+                _atomic_torch_save(item["path"], payload)
+                written += 1
+                del payload
+                del tensor
+            del embedded
+            _cleanup_torch_memory(device)
+        del model
+        del vocab
+        del smiles_values
+        _cleanup_torch_memory(device)
+
+    return written, feature_dims
+
+
+def _save_structure_payloads(unique_structures, cache_dir: Path, args, legacy):
+    dtype = torch.float16 if args.cache_dtype == "float16" else torch.float32
+    feature_dims = {}
+    written = 0
+    skipped = 0
+    graph_device = str(args.graph_device)
+    use_gpu_graphs = graph_device.startswith("cuda")
+    existing_structure_cache = set() if args.overwrite else _build_existing_structure_cache_index(cache_dir)
+    _log(f"Structure cache: {len(unique_structures)} unique PDB structures", args.verbose)
+    graph_tasks = []
+    for entry in progress(unique_structures.values(), desc="Resolving structures", unit="structure"):
+        path = structure_cache_path(cache_dir, structure_id=entry["structure_id"], fallback_sequence=entry["sequence"])
+        if not args.overwrite and str(path) in existing_structure_cache:
+            if (
+                ("pst" in args.feature_list and "pst" not in feature_dims)
+                or ("dssp" in args.feature_list and "dssp" not in feature_dims)
+            ):
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+                _update_feature_dims_from_payload(payload, feature_dims, args.feature_list)
+            continue
+        payload = _make_structure_payload(entry)
+
+        legacy_graph = resolve_legacy_feature(legacy.get("graph"), entry["protein_id"], entry["structure_id"])
+        if legacy_graph is not None:
+            payload["graph"] = legacy_graph
+            current_dims = _finalize_structure_payload(path, payload, entry, args, legacy, dtype)
+            feature_dims.update(current_dims)
+            written += 1
+            del payload
+        else:
+            pdb_path = _resolve_pdb_path(entry, args)
+            if pdb_path is None:
+                _log(
+                    f"Skipping structure cache for `{entry['structure_id']}` because no matching PDB file was found.",
+                    args.verbose,
+                )
+                skipped += 1
+                continue
+            graph_tasks.append(
+                {
+                    "structure_key": entry["structure_id"],
+                    "pdb_path": str(pdb_path),
+                    "graph_atom_type": args.graph_atom_type,
+                    "path": path,
+                    "entry": entry,
+                }
+            )
+
+    if graph_tasks:
+        if use_gpu_graphs:
+            parse_workers = max(1, int(args.graph_parse_workers))
+            prefetch_limit = max(1, int(args.graph_prefetch))
+            cleanup_interval = max(0, int(args.graph_cleanup_interval))
+            _log(
+                f"Building {len(graph_tasks)} structure graphs on {graph_device} with {parse_workers} CPU parse threads, prefetch={prefetch_limit}, cleanup_interval={cleanup_interval}",
+                args.verbose,
+            )
+            task_iter = iter(graph_tasks)
+            pending = {}
+            processed = 0
+            with ThreadPoolExecutor(max_workers=parse_workers) as pool:
+                def submit_until_full():
+                    while len(pending) < prefetch_limit:
+                        try:
+                            task = next(task_iter)
+                        except StopIteration:
+                            break
+                        future = pool.submit(_parse_pdb_worker, task)
+                        pending[future] = task
+
+                submit_until_full()
+                with progress(total=len(graph_tasks), desc="Building structure graphs", unit="structure") as graph_bar:
+                    while pending:
+                        future = next(as_completed(list(pending.keys())))
+                        task = pending.pop(future)
+                        try:
+                            result = future.result()
+                            payload = _make_structure_payload(task["entry"])
+                            graph = build_graph_from_array(
+                                result["pdb_array"],
+                                device=graph_device,
+                            )
+                            payload["graph"] = graph
+                            current_dims = _finalize_structure_payload(task["path"], payload, task["entry"], args, legacy, dtype)
+                            feature_dims.update(current_dims)
+                            written += 1
+                            del payload
+                            del graph
+                            del result
+                        except Exception as exc:
+                            skipped += 1
+                            print(f"Skipping structure `{task['entry']['structure_id']}` because graph build failed for {task['pdb_path']}: {exc}", flush=True)
+                        processed += 1
+                        _maybe_cleanup_torch_memory(processed, cleanup_interval, graph_device)
+                        graph_bar.update(1)
+                        submit_until_full()
+            _cleanup_torch_memory(graph_device)
+        else:
+            max_workers = min(len(graph_tasks), os.cpu_count() or 1)
+            _log(f"Building {len(graph_tasks)} structure graphs with up to {max_workers} CPU workers", args.verbose)
+            futures = {}
+            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                for task in graph_tasks:
+                    future = pool.submit(_build_graph_worker, task)
+                    futures[future] = task
+                for future in progress(as_completed(futures), total=len(futures), desc="Building structure graphs", unit="structure"):
+                    task = futures[future]
+                    try:
+                        result = future.result()
+                        payload = _make_structure_payload(task["entry"])
+                        payload["graph"] = result["graph"]
+                        current_dims = _finalize_structure_payload(task["path"], payload, task["entry"], args, legacy, dtype)
+                        feature_dims.update(current_dims)
+                        written += 1
+                        del payload
+                        del result
+                    except Exception as exc:
+                        skipped += 1
+                        print(f"Skipping structure `{task['entry']['structure_id']}` because graph build failed for {task['pdb_path']}: {exc}", flush=True)
+    return written, feature_dims, skipped
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build reusable DEKP caches for EMULaToR split retraining.")
+    parser.add_argument("--task", choices=TASKS, default="km")
+    parser.add_argument("--base_dir", type=str, default=None)
+    parser.add_argument("--cache_dir", type=str, default=None)
+    parser.add_argument("--manifests_dir", type=str, default=None)
+    parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
+    parser.add_argument("--threshold", type=str, default=None)
+    parser.add_argument("--thresholds", nargs="+", default=None)
+    parser.add_argument("--feature_list", type=str, default=",".join(DEFAULT_FEATURES))
+    parser.add_argument("--sequence_col", type=str, default=None)
+    parser.add_argument("--smiles_col", type=str, default=None)
+    parser.add_argument("--protein_id_col", type=str, default=None)
+    parser.add_argument("--structure_id_col", type=str, default=None)
+    parser.add_argument("--cid_col", type=str, default=None)
+    parser.add_argument("--pdb_type_col", type=str, default=None)
+    parser.add_argument("--pdb_source_col", type=str, default=None)
+    parser.add_argument("--pdb_record_col", type=str, default=None)
+    parser.add_argument("--legacy_feature_dir", type=str, default=None)
+    parser.add_argument("--experimental_pdb_dir", type=str, default=None)
+    parser.add_argument("--alphafold_pdb_dir", type=str, default=None)
+    parser.add_argument("--esm_pdb_dir", type=str, default=None)
+    parser.add_argument("--pdb_suffix", type=str, default=".pdb")
+    parser.add_argument("--prot_t5_model", type=str, default="Rostlab/prot_t5_xl_uniref50")
+    parser.add_argument("--trfm_weights_path", type=str, default=None)
+    parser.add_argument("--trfm_vocab_path", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--graph_device", type=str, default=None)
+    parser.add_argument("--cache_dtype", choices=["float16", "float32"], default="float32")
+    parser.add_argument("--trfm_batch_size", type=int, default=256)
+    parser.add_argument("--graph_atom_type", type=str, default="CA")
+    parser.add_argument("--graph_parse_workers", type=int, default=None)
+    parser.add_argument("--graph_prefetch", type=int, default=None)
+    parser.add_argument("--graph_cleanup_interval", type=int, default=64)
+    parser.add_argument("--dssp_executable", type=str, default=None)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--dry_run", action="store_true", help="Count unique and missing cache items, then exit.")
+    args = parser.parse_args()
+    args.verbose = True
+
+    paths = task_paths(args.task)
+    args.base_dir = Path(args.base_dir or paths["base_dir"]).expanduser()
+    args.cache_dir = Path(args.cache_dir or paths["cache_dir"]).expanduser()
+    args.manifests_dir = Path(args.manifests_dir or paths["manifests_dir"]).expanduser()
+    args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
+    args.feature_list = [item.strip() for item in args.feature_list.split(",") if item.strip()]
+    args.graph_device = args.graph_device or args.device
+    if str(args.graph_device).startswith("cuda") and not torch.cuda.is_available():
+        _log(f"Requested graph_device={args.graph_device} but CUDA is unavailable; falling back to cpu", True)
+        args.graph_device = "cpu"
+    cpu_count = os.cpu_count() or 1
+    if args.graph_parse_workers is None:
+        if str(args.graph_device).startswith("cuda"):
+            args.graph_parse_workers = max(2, min(8, cpu_count))
+        else:
+            args.graph_parse_workers = max(1, min(4, cpu_count))
+    if args.graph_prefetch is None:
+        if str(args.graph_device).startswith("cuda"):
+            args.graph_prefetch = max(16, args.graph_parse_workers * 4)
+        else:
+            args.graph_prefetch = max(4, args.graph_parse_workers)
+    args._pdb_indexes = _build_pdb_indexes(args)
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    jobs = discover_split_jobs(args.base_dir, split_groups=args.split_groups, thresholds=args.thresholds)
+    if not jobs:
+        raise FileNotFoundError(f"No split jobs discovered in {args.base_dir}")
+    jobs = apply_manifest_paths_to_jobs(jobs, args.manifests_dir, require=True)
+    _log(f"Discovered {len(jobs)} split jobs in {args.base_dir} for groups={args.split_groups} and thresholds={args.thresholds}", args.verbose)
+    sample_frame = read_table(Path(jobs[0]["train_path"]))
+    _log(f"Sample frame columns: {sample_frame.columns.tolist()}", args.verbose)
+    column_names = _resolve_columns(sample_frame, args)
+    if column_names["protein_id_col"] is None:
+        column_names["protein_id_col"] = column_names["sequence_col"]
+    if column_names["structure_id_col"] is None:
+        column_names["structure_id_col"] = column_names["pdb_record_col"] or column_names["protein_id_col"]
+    _log(f"Resolved column names: {column_names}", args.verbose)
+
+    started = time.time()
+    unique_sequences, unique_smiles, unique_structures = _iter_unique_rows(jobs, column_names)
+    _log(
+        f"Discovered {len(jobs)} split job(s) | {len(unique_sequences)} sequences | {len(unique_smiles)} smiles | {len(unique_structures)} structures",
+        args.verbose,
+    )
+    _log(f"CUDA available={torch.cuda.is_available()} | selected device={args.device}", args.verbose)
+    if args.verbose and torch.cuda.is_available() and str(args.device).startswith("cuda"):
+        try:
+            device_index = int(str(args.device).split(":")[-1]) if ":" in str(args.device) else torch.cuda.current_device()
+            _log(
+                f"CUDA device {device_index}: {torch.cuda.get_device_name(device_index)} | capability={torch.cuda.get_device_capability(device_index)}",
+                True,
+            )
+        except Exception:
+            pass
+
+    protein_tokenizer = load_protein_tokenizer(args.prot_t5_model)
+    smiles_tokenizer = load_smiles_tokenizer()
+
+    legacy = {}
+    if args.legacy_feature_dir:
+        legacy = load_legacy_feature_pickles(Path(args.legacy_feature_dir), set(args.feature_list) | {"graph"})
+
+    # The original positional encoding depends on the molecule's column in its chunk of 100. The column comes from
+    # the row order of the full task table, as in the original Dataset.csv.
+    trfm_columns = trfm_column_map(args.base_dir / f"{args.task}_kinetic_params_1d.parquet")
+    trfm_fp = trfm_fingerprint(trfm_columns)
+    missing_columns = sum(smiles not in trfm_columns for smiles in unique_smiles)
+    _log(f"TRFM columns: {len(trfm_columns)} SMILES in the full table | fingerprint {trfm_fp} | {missing_columns} split SMILES missing (column 0)", True)
+    if args.dry_run:
+        structures_present = _build_existing_structure_cache_index(args.cache_dir)
+        missing = {
+            "proteins": sum(not protein_cache_path(args.cache_dir, e["sequence"]).exists() for e in unique_sequences.values()),
+            "ligands": sum(not ligand_cache_path(args.cache_dir, e["smiles"], trfm_fp).exists() for e in unique_smiles.values()),
+            "structures": sum(
+                str(structure_cache_path(args.cache_dir, e["structure_id"], e["sequence"])) not in structures_present
+                for e in unique_structures.values()
+            ),
+        }
+        totals = {"proteins": len(unique_sequences), "ligands": len(unique_smiles), "structures": len(unique_structures)}
+        unresolved = sum(
+            _resolve_pdb_path(e, args) is None
+            for e in unique_structures.values()
+            if str(structure_cache_path(args.cache_dir, e["structure_id"], e["sequence"])) not in structures_present
+        )
+        _log(f"Dry run | unique {totals} | missing {missing} | missing structures without a PDB file: {unresolved}", True)
+        return
+    protein_written, protein_dims = _save_protein_payloads(unique_sequences, args.cache_dir, protein_tokenizer, args, legacy)
+    ligand_written, ligand_dims = _save_ligand_payloads(unique_smiles, args.cache_dir, smiles_tokenizer, args, legacy, trfm_columns, trfm_fp)
+    structure_written, structure_dims, structure_skipped = _save_structure_payloads(unique_structures, args.cache_dir, args, legacy)
+
+    feature_dims = {}
+    feature_dims.update(protein_dims)
+    feature_dims.update(ligand_dims)
+    feature_dims.update(structure_dims)
+
+    manifest = {
+        "cache_version": CACHE_VERSION,
+        "trfm_fingerprint": trfm_fp,
+        "base_dir": str(args.base_dir),
+        "cache_dir": str(args.cache_dir),
+        "feature_list": args.feature_list,
+        "resolved_columns": column_names,
+        "protein_vocab_size": protein_tokenizer.vocab_size,
+        "smiles_vocab_size": smiles_tokenizer.vocab_size,
+        "protein_pad_id": protein_tokenizer.pad_token_id,
+        "smiles_pad_id": smiles_tokenizer.pad_token_id,
+        "feature_dims": feature_dims,
+        "counts": {
+            "split_jobs": len(jobs),
+            "unique_sequences": len(unique_sequences),
+            "unique_smiles": len(unique_smiles),
+            "unique_structures": len(unique_structures),
+            "proteins_written": protein_written,
+            "ligands_written": ligand_written,
+            "structures_written": structure_written,
+            "structures_skipped": structure_skipped,
+        },
+        "legacy_feature_dir": str(args.legacy_feature_dir) if args.legacy_feature_dir else None,
+        "prot_t5_model": args.prot_t5_model,
+        "trfm_weights_path": str(args.trfm_weights_path) if args.trfm_weights_path else None,
+        "trfm_vocab_path": str(args.trfm_vocab_path) if args.trfm_vocab_path else None,
+        "elapsed_seconds": time.time() - started,
+    }
+    save_json(args.cache_dir / "manifest.json", manifest)
+
+    _log(f"Saved cache manifest to {args.cache_dir / 'manifest.json'}", True)
+    _log(
+        f"Done: proteins_written={protein_written} | ligands_written={ligand_written} | structures_written={structure_written} | structures_skipped={structure_skipped} | elapsed={manifest['elapsed_seconds']:.1f}s",
+        True,
+    )
+
+
+if __name__ == "__main__":
+    main()
